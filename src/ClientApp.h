@@ -1,6 +1,7 @@
 #include "MoveOnlyFunction.h"
 #include <string>
 #include <string_view>
+#include <vector>
 #include <random>
 #include <sstream>
 #include <iostream>
@@ -311,12 +312,13 @@ namespace uWS {
         WebSocketClientBehavior *behavior;
         void *socket = nullptr; // Using void* to avoid uSockets dependency
         bool connected = false;
-        std::string sendBuffer;
-        std::string receiveBuffer;
+        std::vector<char> sendBuffer;
+        std::vector<char> receiveBuffer;
+        size_t readOffset = 0;
         unsigned char currentMask[4];
 
         // Fragmentation support
-        std::string fragmentBuffer;
+        std::vector<char> fragmentBuffer;
         WebSocketFrame::OpCode fragmentOpCode;
         bool inFragment = false;
 
@@ -450,12 +452,12 @@ namespace uWS {
         }
 
         void appendReceiveData(const char *data, size_t length) {
-            receiveBuffer.append(data, length);
+            receiveBuffer.insert(receiveBuffer.end(), data, data + length);
             processReceiveBuffer();
         }
 
         void processReceiveBuffer() {
-            size_t offset = 0;
+            size_t offset = readOffset;
 
             while (offset < receiveBuffer.size()) {
                 WebSocketFrame::OpCode opCode;
@@ -479,24 +481,27 @@ namespace uWS {
                 offset += frameSize;
             }
 
-            // Remove processed data
-            if (offset > 0) {
-                receiveBuffer.erase(0, offset);
+            readOffset = offset;
+            // Compact buffer if more than half is processed
+            if (readOffset > receiveBuffer.size() / 2 && readOffset > 0) {
+                std::copy(receiveBuffer.begin() + readOffset, receiveBuffer.end(), receiveBuffer.begin());
+                receiveBuffer.resize(receiveBuffer.size() - readOffset);
+                readOffset = 0;
             }
         }
 
         bool handleFrameFragmented(WebSocketFrame::OpCode opCode, bool fin,
-                                 const char *payload, size_t length, const unsigned char *mask) {
-            std::string message;
+                                  const char *payload, size_t length, const unsigned char *mask) {
+            std::vector<char> message;
 
             // Unmask if necessary
             if (mask) {
-                message.reserve(length);
+                message.resize(length);
                 for (size_t i = 0; i < length; ++i) {
-                    message.push_back(payload[i] ^ mask[i % 4]);
+                    message[i] = payload[i] ^ mask[i % 4];
                 }
             } else {
-                message.assign(payload, length);
+                message.assign(payload, payload + length);
             }
 
             // Handle fragmentation
@@ -506,7 +511,7 @@ namespace uWS {
                     close(1002, "Unexpected continuation frame");
                     return false;
                 }
-                fragmentBuffer.append(message);
+                fragmentBuffer.insert(fragmentBuffer.end(), message.begin(), message.end());
             } else {
                 if (inFragment) {
                     // Previous fragment not finished
@@ -518,12 +523,12 @@ namespace uWS {
                     // Start new fragment
                     inFragment = true;
                     fragmentOpCode = opCode;
-                    fragmentBuffer = message;
+                    fragmentBuffer = std::move(message);
                     return true; // Wait for more fragments
                 } else {
                     // Single frame message
                     fragmentOpCode = opCode;
-                    fragmentBuffer = message;
+                    fragmentBuffer = std::move(message);
                 }
             }
 
@@ -537,7 +542,7 @@ namespace uWS {
             return true;
         }
 
-        void handleCompleteMessage(WebSocketFrame::OpCode opCode, const std::string& message) {
+        void handleCompleteMessage(WebSocketFrame::OpCode opCode, const std::vector<char>& message) {
             handleFrame(opCode, true, message.data(), message.size(), nullptr);
         }
 
