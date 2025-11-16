@@ -34,10 +34,14 @@ int main() {
     auto messageHandler = [](void *ws, std::string_view message, int opCode) {
         if (opCode != 1) return; // Only handle TEXT messages
         auto recvTime = std::chrono::system_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(recvTime - sendTime).count();
-        auto recv_t = std::chrono::system_clock::to_time_t(recvTime);
-        std::cout << "📨 Received at " << std::put_time(std::gmtime(&recv_t), "%F %T") << " (" << elapsed << "ms after send): " << message;
-        if (elapsed > 100) std::cout << " [SLOW]";
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(recvTime - sendTime).count();
+        auto elapsed_ms = elapsed_us / 1000;
+        auto recv_us = std::chrono::duration_cast<std::chrono::microseconds>(recvTime.time_since_epoch()).count();
+        auto seconds = recv_us / 1000000;
+        auto micros = recv_us % 1000000;
+        std::time_t t = seconds;
+        std::cout << "📨 Received at " << std::put_time(std::gmtime(&t), "%F %T") << "." << std::setfill('0') << std::setw(6) << micros << " (" << elapsed_us << "us after send): " << message;
+        if (elapsed_ms > 100) std::cout << " [SLOW]";
         std::cout << std::endl;
         // Echoing would require access to the client instance, which we don't have here
         // So, perhaps store a reference or use a global
@@ -106,11 +110,14 @@ int main() {
 
         WebSocketClient& client = *client_ptr;
 
-        // Send initial message
-        std::string helloMsg = "Hello from production client!";
-        sendTime = std::chrono::system_clock::now();
-        auto send_t = std::chrono::system_clock::to_time_t(sendTime);
-        std::cout << "📤 Queueing at " << std::put_time(std::gmtime(&send_t), "%F %T") << ": " << helloMsg << std::endl;
+            // Send initial message
+            std::string helloMsg = "Hello from production client!";
+            sendTime = std::chrono::system_clock::now();
+            auto send_us = std::chrono::duration_cast<std::chrono::microseconds>(sendTime.time_since_epoch()).count();
+            auto seconds = send_us / 1000000;
+            auto micros = send_us % 1000000;
+            std::time_t t = seconds;
+            std::cout << "📤 Queueing at " << std::put_time(std::gmtime(&t), "%F %T") << "." << std::setfill('0') << std::setw(6) << micros << ": " << helloMsg << std::endl;
         client.sendMessage(helloMsg);
 
         auto sent = 0;
