@@ -10,7 +10,7 @@ int main(int argc, char **argv) {
     char *EXEC_SUFFIX = strncpy(calloc(1024, 1), maybe(getenv("EXEC_SUFFIX")), 1024);
 
     char *EXAMPLE_FILES[] = {"SecureGzipFileServer", "Precompress", "EchoBody", "HelloWorldThreaded", "Http3Server", "Broadcast", "HelloWorld", "Crc32", "ServerName",
-    "EchoServer", "BroadcastingEchoServer", "UpgradeSync", "UpgradeAsync", "ParameterRoutes", "Client"};
+    "EchoServer", "BroadcastingEchoServer", "UpgradeSync", "UpgradeAsync", "ParameterRoutes", "Client", "HttpClient"};
 
     strcat(CXXFLAGS, " -march=native -O3 -Wpedantic -Wall -Wextra -Wsign-conversion -Wconversion -std=c++2b -Isrc -IuSockets/src");
     strcat(LDFLAGS, " uSockets/*.o");
