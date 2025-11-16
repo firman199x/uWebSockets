@@ -18,7 +18,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/select.h>
+#include <poll.h>
 #ifdef LIBUS_USE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -460,22 +460,20 @@ public:
         }
 
         // Read response
-        std::string response;
-        char buffer[4096];
+        char response_buffer[4096];
+        size_t response_size = 0;
         ssize_t n;
         // Wait for response
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(socket_fd, &readfds);
-        struct timeval tv_timeout = {5, 0}; // 5 second timeout
-        if (select(socket_fd + 1, &readfds, nullptr, nullptr, &tv_timeout) <= 0) {
+        struct pollfd pfd = {socket_fd, POLLIN, 0};
+        int timeout_ms = 5000; // 5 second timeout
+        if (poll(&pfd, 1, timeout_ms) <= 0) {
             disconnect();
             return false;
         }
-        while (true) {
+        while (response_size < sizeof(response_buffer)) {
 #ifdef LIBUS_USE_OPENSSL
             if (use_ssl) {
-                n = SSL_read(static_cast<SSL*>(ssl), buffer, sizeof(buffer));
+                n = SSL_read(static_cast<SSL*>(ssl), response_buffer + response_size, sizeof(response_buffer) - response_size);
                 if (n < 0) {
                     int ssl_err = SSL_get_error(static_cast<SSL*>(ssl), static_cast<int>(n));
                     if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
@@ -486,7 +484,7 @@ public:
             } else
 #endif
             {
-                n = read(socket_fd, buffer, sizeof(buffer));
+                n = read(socket_fd, response_buffer + response_size, sizeof(response_buffer) - response_size);
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         continue; // would block, try again
@@ -495,12 +493,20 @@ public:
                 }
             }
             if (n == 0) break;
-            response.append(buffer, n);
-            if (response.find("\r\n\r\n") != std::string::npos) break;
+            response_size += n;
+            // Check for end of headers
+            if (response_size >= 4 && memcmp(response_buffer + response_size - 4, "\r\n\r\n", 4) == 0) break;
         }
 
-        // Check for 101 Switching Protocols
-        if (response.find("HTTP/1.1 101") == std::string::npos) {
+        // Parse status line
+        std::string_view response_view(response_buffer, response_size);
+        size_t status_end = response_view.find("\r\n");
+        if (status_end == std::string_view::npos) {
+            disconnect();
+            return false;
+        }
+        std::string_view status_line = response_view.substr(0, status_end);
+        if (status_line.find("101") == std::string_view::npos) {
             disconnect();
             return false;
         }

@@ -56,42 +56,74 @@ int main() {
         std::cout << "❌ Connection failed!" << std::endl;
     };
 
-    uWS::WebSocketClientBehavior behavior;
-    behavior.open = openHandler;
-    behavior.message = messageHandler;
-    behavior.close = closeHandler;
-    behavior.failed = failedHandler;
-
     try {
-        WebSocketClient client(std::move(behavior), "ws://localhost:9001");
+        const std::string url = "ws://localhost:9001";
+        int reconnect_attempts = 0;
+        const int max_attempts = 5;
+        std::chrono::milliseconds backoff(1000);
 
-        // Wait a bit for connection
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        WebSocketClient* client_ptr = nullptr;
+        bool connected = false;
 
-        if (client.isConnected()) {
-            std::cout << "🔗 Connected successfully!" << std::endl;
-
-            // Send initial message
-            std::string helloMsg = "Hello from production client!";
-            sendTime = std::chrono::system_clock::now();
-            auto send_t = std::chrono::system_clock::to_time_t(sendTime);
-            std::cout << "📤 Queueing at " << std::put_time(std::gmtime(&send_t), "%F %T") << ": " << helloMsg << std::endl;
-            client.sendMessage(helloMsg);
-
-            auto sent = 0;
-            while (sent < 10) {
-                auto msg = "Hello from production client! " + std::to_string(sent);
-                client.sendMessage(msg);
-                sent++;
+        while (reconnect_attempts < max_attempts && !connected) {
+            if (reconnect_attempts > 0) {
+                std::cout << "Retrying connection in " << backoff.count() << " ms..." << std::endl;
+                std::this_thread::sleep_for(backoff);
+                backoff = std::min(backoff * 2, std::chrono::milliseconds(30000)); // cap at 30s
             }
 
+            try {
+                uWS::WebSocketClientBehavior behavior;
+                behavior.open = openHandler;
+                behavior.message = messageHandler;
+                behavior.close = closeHandler;
+                behavior.failed = failedHandler;
 
-            std::this_thread::sleep_for(std::chrono::seconds(20));
-
-            std::cout << "👋 Shutting down gracefully..." << std::endl;
-        } else {
-            std::cout << "❌ Failed to connect!" << std::endl;
+                client_ptr = new WebSocketClient(std::move(behavior), url);
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (client_ptr->isConnected()) {
+                    connected = true;
+                    std::cout << "🔗 Connected successfully!" << std::endl;
+                } else {
+                    delete client_ptr;
+                    client_ptr = nullptr;
+                    reconnect_attempts++;
+                }
+            } catch (const std::runtime_error& e) {
+                std::cout << "Connection attempt failed: " << e.what() << std::endl;
+                if (client_ptr) {
+                    delete client_ptr;
+                    client_ptr = nullptr;
+                }
+                reconnect_attempts++;
+            }
         }
+
+        if (!connected) {
+            std::cout << "❌ Failed to connect after " << max_attempts << " attempts!" << std::endl;
+            return 1;
+        }
+
+        WebSocketClient& client = *client_ptr;
+
+        // Send initial message
+        std::string helloMsg = "Hello from production client!";
+        sendTime = std::chrono::system_clock::now();
+        auto send_t = std::chrono::system_clock::to_time_t(sendTime);
+        std::cout << "📤 Queueing at " << std::put_time(std::gmtime(&send_t), "%F %T") << ": " << helloMsg << std::endl;
+        client.sendMessage(helloMsg);
+
+        auto sent = 0;
+        while (sent < 10) {
+            auto msg = "Hello from production client! " + std::to_string(sent);
+            client.sendMessage(msg);
+            sent++;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+
+        std::cout << "👋 Shutting down gracefully..." << std::endl;
+        delete client_ptr;
     } catch (const std::runtime_error& e) {
         std::cout << "Error: " << e.what() << std::endl;
     }
