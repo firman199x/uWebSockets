@@ -1,0 +1,25 @@
+*.o
+*.a
+
+# Compiled executables
+Broadcast
+BroadcastingEchoServer
+Client
+Crc32
+EchoBody
+EchoServer
+HelloWorld
+HelloWorldThreaded
+Http3Server
+ParameterRoutes
+Precompress
+SecureGzipFileServer
+ServerName
+UpgradeAsync
+UpgradeSync
+rpcclient
+build
+
+# Test executables
+tests/ClientAppTest
+tests/HttpRouter
