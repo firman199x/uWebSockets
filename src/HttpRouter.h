@@ -30,6 +30,7 @@
 #include <iostream>
 
 #include "MoveOnlyFunction.h"
+#include <cstdint>
 
 namespace uWS {
 
