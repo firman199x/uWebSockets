@@ -94,6 +94,10 @@ private:
     std::string method = "GET";
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    int redirect_count = 0;
+    std::string redirect_url;
+    int max_retries = 3;
+    std::chrono::milliseconds base_retry_delay = std::chrono::milliseconds(1000);
 
 public:
     HttpClient(HttpClientBehavior &&b) : behavior(std::move(b)) {}
@@ -120,30 +124,108 @@ public:
         path = parsed.path;
         use_ssl = parsed.ssl;
 
-        // Create socket
-        socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (socket_fd < 0)
-            return false;
+        for (int attempt = 0; attempt <= max_retries; ++attempt) {
+            if (attempt > 0) {
+                std::chrono::milliseconds delay = base_retry_delay * (1LL << (attempt - 1));
+                std::this_thread::sleep_for(delay);
+            }
 
-        // Set non-blocking
-        fcntl(socket_fd, F_SETFL, O_NONBLOCK);
+            // Create socket
+            socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (socket_fd < 0)
+                continue;
 
-        sockaddr_in server_addr{};
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(static_cast<uint16_t>(std::stoi(port)));
+            // Set non-blocking
+            fcntl(socket_fd, F_SETFL, O_NONBLOCK);
 
-        // Resolve hostname
-        struct hostent *he = gethostbyname(host.c_str());
-        if (!he) return false;
-        memcpy(&server_addr.sin_addr, he->h_addr, he->h_length);
+            sockaddr_in server_addr{};
+            server_addr.sin_family = AF_INET;
 
-        if (::connect(socket_fd, (sockaddr *)&server_addr, sizeof(server_addr)) <
-                0 &&
-            errno != EINPROGRESS) {
-            close(socket_fd);
-            socket_fd = -1;
-            return false;
+            // Resolve hostname
+            struct addrinfo hints = {};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            struct addrinfo *result;
+            int res = getaddrinfo(host.c_str(), port.c_str(), &hints, &result);
+            if (res != 0) {
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+            if (!result) {
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+            memcpy(&server_addr, result->ai_addr, sizeof(sockaddr_in));
+            freeaddrinfo(result);
+
+            if (::connect(socket_fd, (sockaddr *)&server_addr, sizeof(server_addr)) <
+                    0 &&
+                errno != EINPROGRESS) {
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+
+            // Wait for connection
+            fd_set writefds;
+            FD_ZERO(&writefds);
+            FD_SET(socket_fd, &writefds);
+            struct timeval tv = {5, 0}; // 5 second timeout
+            if (select(socket_fd + 1, nullptr, &writefds, nullptr, &tv) <= 0) {
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+
+            int error;
+            socklen_t len = sizeof(error);
+            getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &len);
+            if (error) {
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+
+            // SSL setup if needed
+            if (use_ssl) {
+#ifdef LIBUS_USE_OPENSSL
+                SSL_library_init();
+                ssl_ctx = SSL_CTX_new(TLS_client_method());
+                SSL_CTX_set_default_verify_paths(ssl_ctx);
+                SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
+                if (!ssl_ctx) {
+                    close(socket_fd);
+                    socket_fd = -1;
+                    continue;
+                }
+                ssl = SSL_new(ssl_ctx);
+                SSL_set_tlsext_host_name(static_cast<SSL *>(ssl), host.c_str());
+                SSL_set_fd(static_cast<SSL *>(ssl), socket_fd);
+                if (SSL_connect(static_cast<SSL *>(ssl)) != 1) {
+                    SSL_free(static_cast<SSL *>(ssl));
+                    ssl = nullptr;
+                    SSL_CTX_free(ssl_ctx);
+                    ssl_ctx = nullptr;
+                    close(socket_fd);
+                    socket_fd = -1;
+                    continue;
+                }
+#else
+                // SSL not supported
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+#endif
+            }
+
+            connected = true;
+            return true;
         }
+        return false;
+    }
 
         // Wait for connection
         fd_set writefds;
@@ -170,7 +252,8 @@ public:
 #ifdef LIBUS_USE_OPENSSL
             SSL_library_init();
             ssl_ctx = SSL_CTX_new(TLS_client_method());
-            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, nullptr);
+            SSL_CTX_set_default_verify_paths(ssl_ctx);
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
             if (!ssl_ctx) {
                 close(socket_fd);
                 socket_fd = -1;
@@ -219,6 +302,8 @@ public:
     void sendRequest() {
         if (!connected) return;
 
+        redirect_url.clear();
+
         std::string request = method + " " + path + " HTTP/1.1\r\n";
         request += "Host: " + host + ":" + port + "\r\n";
         for (auto &[key, value] : headers) {
@@ -249,6 +334,16 @@ public:
 
         // Now read response
         readResponse();
+
+        if (!redirect_url.empty() && redirect_count < 5) {
+            redirect_count++;
+            disconnect();
+            if (connect(redirect_url)) {
+                sendRequest();
+            } else {
+                if (behavior.failed) behavior.failed();
+            }
+        }
     }
 
 private:
@@ -323,7 +418,15 @@ private:
                     }
 
                     headers_parsed = true;
-                    if (behavior.response) {
+                    if (status_code >= 300 && status_code < 400) {
+                        for (auto &[key, value] : response_headers) {
+                            if (std::string_view(key) == "Location") {
+                                redirect_url = std::string(value);
+                                break;
+                            }
+                        }
+                    }
+                    if (redirect_url.empty() && behavior.response) {
                         behavior.response(this, status_code, status_message, response_headers);
                     }
 
@@ -333,7 +436,7 @@ private:
             }
 
             if (headers_parsed && !response_buffer.empty()) {
-                if (behavior.data) {
+                if (redirect_url.empty() && behavior.data) {
                     behavior.data(this, response_buffer, false);
                 }
                 response_buffer.clear();
@@ -341,7 +444,7 @@ private:
         }
 
         // End of data
-        if (behavior.data) {
+        if (redirect_url.empty() && behavior.data) {
             behavior.data(this, {}, true);
         }
     }
