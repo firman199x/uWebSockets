@@ -24,14 +24,14 @@ int main() {
     std::cout << std::endl;
 
     // Define handlers as before
-    auto openHandler = [](void *ws) {
+    auto openHandler = [](void */* ws */) {
         std::cout << "✅ WebSocket connection opened!" << std::endl;
         // Note: Since we can't call sendMessage here directly, we queue it
         // But for simplicity, we'll send from main after connection
     };
 
     static std::chrono::system_clock::time_point sendTime;
-    auto messageHandler = [](void *ws, std::string_view message, int opCode) {
+    auto messageHandler = [](void */* ws */, std::string_view message, int opCode) {
         if (opCode != 1 && opCode != 2) return; // Handle TEXT and BINARY messages
         auto recvTime = std::chrono::system_clock::now();
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(recvTime - sendTime).count();
@@ -54,7 +54,7 @@ int main() {
         // For this example, we'll skip echoing and just log
     };
 
-    auto closeHandler = [](void *ws, int code, std::string_view message) {
+    auto closeHandler = [](void */* ws */, int code, std::string_view message) {
         std::cout << "❌ WebSocket connection closed!" << std::endl;
         std::cout << "   Code: " << code << std::endl;
         if (!message.empty()) {
