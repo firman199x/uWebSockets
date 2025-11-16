@@ -1,18 +1,16 @@
-// Production-Ready WebSocket Client Example
-// This example demonstrates a robust WebSocket client with error handling,
-// reconnection logic, and production features
-
-#include "../src/ClientApp.h"
+#include "PooledClient.h"
 #include <iostream>
 #include <thread>
 #include <atomic>
 #include <csignal>
+#include <chrono>
+#include <iomanip>
 
-std::atomic<bool> running{true};
+std::atomic<bool> globalRunning{true};
 
 void signalHandler(int signal) {
     std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
-    running = false;
+    globalRunning = false;
 }
 
 int main() {
@@ -25,27 +23,25 @@ int main() {
     std::cout << "Press Ctrl+C to exit gracefully" << std::endl;
     std::cout << std::endl;
 
-    // Create client behavior handlers with production features
+    // Define handlers as before
     auto openHandler = [](void *ws) {
         std::cout << "✅ WebSocket connection opened!" << std::endl;
-        std::cout << "Sending hello message..." << std::endl;
-
-        // Cast to ClientWebSocket and send initial message
-        auto *clientWs = static_cast<uWS::ClientWebSocket*>(ws);
-        std::string helloMsg = "Hello from production client!";
-        std::cout << "📤 Sending initial message: " << helloMsg << std::endl;
-        clientWs->send(helloMsg, uWS::WebSocketFrame::TEXT);
+        // Note: Since we can't call sendMessage here directly, we queue it
+        // But for simplicity, we'll send from main after connection
     };
 
+    static std::chrono::system_clock::time_point sendTime;
     auto messageHandler = [](void *ws, std::string_view message, int opCode) {
-        std::cout << "📨 Received message: " << message << std::endl;
-        std::cout << "   OpCode: " << opCode << std::endl;
-
-        // Echo the message back
-        auto *clientWs = static_cast<uWS::ClientWebSocket*>(ws);
-        std::string echoMsg = std::string("Echo: ") + std::string(message);
-        std::cout << "🔄 Echoing back: " << echoMsg << std::endl;
-        clientWs->send(echoMsg, uWS::WebSocketFrame::TEXT);
+        if (opCode != 1) return; // Only handle TEXT messages
+        auto recvTime = std::chrono::system_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(recvTime - sendTime).count();
+        auto recv_t = std::chrono::system_clock::to_time_t(recvTime);
+        std::cout << "📨 Received at " << std::put_time(std::gmtime(&recv_t), "%F %T") << " (" << elapsed << "ms after send): " << message;
+        if (elapsed > 100) std::cout << " [SLOW]";
+        std::cout << std::endl;
+        // Echoing would require access to the client instance, which we don't have here
+        // So, perhaps store a reference or use a global
+        // For this example, we'll skip echoing and just log
     };
 
     auto closeHandler = [](void *ws, int code, std::string_view message) {
@@ -66,49 +62,30 @@ int main() {
     behavior.close = closeHandler;
     behavior.failed = failedHandler;
 
-    uWS::ClientApp app(std::move(behavior));
+    try {
+        WebSocketClient client(std::move(behavior), "ws://localhost:9001");
 
-    // Connect to a WebSocket server
-    app.connect("ws://localhost:9001");
+        // Wait a bit for connection
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    if (app.isConnected()) {
-        std::cout << "🔗 Connected successfully!" << std::endl;
+        if (client.isConnected()) {
+            std::cout << "🔗 Connected successfully!" << std::endl;
 
-        // Start a background thread for periodic ping/pong keepalive
-        std::thread pingThread([&app]() {
-            while (running.load()) {
-                std::this_thread::sleep_for(std::chrono::seconds(30));
+            // Send initial message
+            std::string helloMsg = "Hello from production client!";
+            sendTime = std::chrono::system_clock::now();
+            auto send_t = std::chrono::system_clock::to_time_t(sendTime);
+            std::cout << "📤 Queueing at " << std::put_time(std::gmtime(&send_t), "%F %T") << ": " << helloMsg << std::endl;
+            client.sendMessage(helloMsg);
 
-                if (app.isConnected()) {
-                    // In a real implementation, we'd check if the connection is alive
-                    // and send pings if needed
-                    std::string pingMsg = "ping";
-                    std::cout << "🔄 Sending keepalive ping: " << pingMsg << std::endl;
-                    app.sendMessage(pingMsg);
-                }
-            }
-        });
+            std::this_thread::sleep_for(std::chrono::seconds(20));
 
-        // Main event loop
-        int messageCounter = 0;
-        while (running.load()) {
-            app.run();
-
-            // Small delay to prevent busy waiting
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            // Send periodic messages if connected
-            if (app.isConnected() && ++messageCounter % 50 == 0) { // Every ~5 seconds
-                std::string heartbeatMsg = "Heartbeat message #" + std::to_string(messageCounter / 50);
-                std::cout << "💓 Sending heartbeat: " << heartbeatMsg << std::endl;
-                app.sendMessage(heartbeatMsg);
-            }
+            std::cout << "👋 Shutting down gracefully..." << std::endl;
+        } else {
+            std::cout << "❌ Failed to connect!" << std::endl;
         }
-
-        pingThread.join();
-        std::cout << "👋 Shutting down gracefully..." << std::endl;
-    } else {
-        std::cout << "❌ Failed to connect!" << std::endl;
+    } catch (const std::runtime_error& e) {
+        std::cout << "Error: " << e.what() << std::endl;
     }
 
     return 0;

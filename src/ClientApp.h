@@ -1,3 +1,5 @@
+#pragma once
+
 #include "MoveOnlyFunction.h"
 #include <string>
 #include <string_view>
@@ -283,16 +285,25 @@ private:
         if (!sendBuffer.empty() && socket_fd >= 0) {
 #ifdef LIBUS_USE_OPENSSL
             if (ssl) {
-                ssize_t written = SSL_write(ssl, sendBuffer.data(), static_cast<int>(sendBuffer.size()));
+                ssize_t written = SSL_write(static_cast<SSL*>(ssl), sendBuffer.data(), static_cast<int>(sendBuffer.size()));
                 if (written > 0) {
                     sendBuffer.erase(sendBuffer.begin(), sendBuffer.begin() + written);
+                } else if (written < 0) {
+                    int ssl_err = SSL_get_error(static_cast<SSL*>(ssl), static_cast<int>(written));
+                    if (ssl_err == SSL_ERROR_WANT_WRITE) {
+                        // Would block, try again later
+                    }
+                    // Handle other errors if needed
                 }
             } else {
 #endif
                 ssize_t written = write(socket_fd, sendBuffer.data(), sendBuffer.size());
                 if (written > 0) {
                     sendBuffer.erase(sendBuffer.begin(), sendBuffer.begin() + written);
+                } else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    // Would block, try again later
                 }
+                // Handle other errors if needed
 #ifdef LIBUS_USE_OPENSSL
             }
 #endif
@@ -393,8 +404,7 @@ public:
             return false;
         }
 
-        // Set blocking again for simplicity
-        fcntl(socket_fd, F_SETFL, 0);
+        // Keep non-blocking for async I/O
 
         // SSL setup if needed
         if (use_ssl) {
@@ -426,42 +436,71 @@ public:
 #endif
         }
 
-        // WebSocket handshake
+        // Perform WebSocket handshake
         std::string key = generateWebSocketKey();
         std::string handshake = "GET " + path + " HTTP/1.1\r\n"
-                                "Host: " + host + ":" + port + "\r\n"
-                                "Upgrade: websocket\r\n"
-                                "Connection: Upgrade\r\n"
-                                "Sec-WebSocket-Key: " + key + "\r\n"
-                                "Sec-WebSocket-Version: 13\r\n\r\n";
+            "Host: " + host + ":" + port + "\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: " + key + "\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
 
+        ssize_t sent;
 #ifdef LIBUS_USE_OPENSSL
-        if (ssl) {
-            SSL_write(ssl, handshake.data(), static_cast<int>(handshake.size()));
+        if (use_ssl) {
+            sent = SSL_write(static_cast<SSL*>(ssl), handshake.data(), handshake.size());
         } else
 #endif
         {
-            write(socket_fd, handshake.data(), handshake.size());
+            sent = write(socket_fd, handshake.data(), handshake.size());
         }
-
-        // Read response
-        char buffer[4096];
-        ssize_t n;
-#ifdef LIBUS_USE_OPENSSL
-        if (ssl) {
-            n = SSL_read(static_cast<SSL*>(ssl), buffer, sizeof(buffer));
-        } else
-#endif
-        {
-            n = read(socket_fd, buffer, sizeof(buffer));
-        }
-        if (n <= 0) {
+        if (sent != static_cast<ssize_t>(handshake.size())) {
             disconnect();
             return false;
         }
 
-        std::string response(buffer, static_cast<size_t>(n));
-        if (response.find("101 Switching Protocols") == std::string::npos) {
+        // Read response
+        std::string response;
+        char buffer[4096];
+        ssize_t n;
+        // Wait for response
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(socket_fd, &readfds);
+        struct timeval tv_timeout = {5, 0}; // 5 second timeout
+        if (select(socket_fd + 1, &readfds, nullptr, nullptr, &tv_timeout) <= 0) {
+            disconnect();
+            return false;
+        }
+        while (true) {
+#ifdef LIBUS_USE_OPENSSL
+            if (use_ssl) {
+                n = SSL_read(static_cast<SSL*>(ssl), buffer, sizeof(buffer));
+                if (n < 0) {
+                    int ssl_err = SSL_get_error(static_cast<SSL*>(ssl), static_cast<int>(n));
+                    if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                        continue; // would block, try again
+                    }
+                    break;
+                }
+            } else
+#endif
+            {
+                n = read(socket_fd, buffer, sizeof(buffer));
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        continue; // would block, try again
+                    }
+                    break;
+                }
+            }
+            if (n == 0) break;
+            response.append(buffer, n);
+            if (response.find("\r\n\r\n") != std::string::npos) break;
+        }
+
+        // Check for 101 Switching Protocols
+        if (response.find("HTTP/1.1 101") == std::string::npos) {
             disconnect();
             return false;
         }
@@ -514,10 +553,25 @@ public:
 #ifdef LIBUS_USE_OPENSSL
         if (ssl) {
             n = SSL_read(static_cast<SSL*>(ssl), buffer, sizeof(buffer));
+            if (n < 0) {
+                int ssl_err = SSL_get_error(static_cast<SSL*>(ssl), static_cast<int>(n));
+                if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                    return; // would block, try again later
+                }
+                // Handle other SSL errors if needed
+                return;
+            }
         } else
 #endif
         {
             n = read(socket_fd, buffer, sizeof(buffer));
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return; // no data available, try again later
+                }
+                // Handle other errors if needed
+                return;
+            }
         }
         if (n > 0) {
             ws->processData(buffer, static_cast<int>(n));
