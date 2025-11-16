@@ -12,12 +12,8 @@ int main() {
 
     /* Keep in mind that uWS::SSLApp({options}) is the same as uWS::App() when compiled without SSL support.
      * You may swap to using uWS:App() if you don't need SSL */
-    uWS::App({
-        /* There are example certificates in uWebSockets.js repo */
-        .key_file_name = "misc/key.pem",
-        .cert_file_name = "misc/cert.pem",
-        .passphrase = "1234"
-    }).ws<PerSocketData>("/*", {
+    uWS::App app;
+    app.ws<PerSocketData>("/*", {
         /* Settings */
         .compression = uWS::CompressOptions(uWS::DEDICATED_COMPRESSOR | uWS::DEDICATED_DECOMPRESSOR),
         .maxPayloadLength = 100 * 1024 * 1024,
@@ -28,31 +24,15 @@ int main() {
         .sendPingsAutomatically = true,
         /* Handlers */
         .upgrade = nullptr,
-        .open = [](auto */*ws*/) {
-            /* Open event here, you may access ws->getUserData() which points to a PerSocketData struct */
-
+        .open = [](auto *ws) {
+            /* Open event here, you may access ws->getUserData() now */
+            std::cout << "New connection" << std::endl;
         },
         .message = [](auto *ws, std::string_view message, uWS::OpCode opCode) {
-            /* This is the opposite of what you probably want; compress if message is LARGER than 16 kb
-             * the reason we do the opposite here; compress if SMALLER than 16 kb is to allow for 
-             * benchmarking of large message sending without compression */
-
-             /* Never mind, it changed back to never compressing for now */
-            ws->send(message, opCode, false);
+            /* Echo the message back */
+            ws->send(message, opCode);
         },
-        .dropped = [](auto */*ws*/, std::string_view /*message*/, uWS::OpCode /*opCode*/) {
-            /* A message was dropped due to set maxBackpressure and closeOnBackpressureLimit limit */
-        },
-        .drain = [](auto */*ws*/) {
-            /* Check ws->getBufferedAmount() here */
-        },
-        .ping = [](auto */*ws*/, std::string_view) {
-            /* Not implemented yet */
-        },
-        .pong = [](auto */*ws*/, std::string_view) {
-            /* Not implemented yet */
-        },
-        .close = [](auto */*ws*/, int /*code*/, std::string_view /*message*/) {
+        .close = [](auto *ws, int code, std::string_view message) {
             /* You may access ws->getUserData() here */
         }
     }).listen(9001, [](auto *listen_socket) {

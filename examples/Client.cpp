@@ -31,8 +31,10 @@ int main() {
         std::cout << "Sending hello message..." << std::endl;
 
         // Cast to ClientWebSocket and send initial message
-        auto *clientWs = static_cast<uWS::ClientWebSocket<false>*>(ws);
-        clientWs->send("Hello from production client!", uWS::WebSocketFrame::TEXT);
+        auto *clientWs = static_cast<uWS::ClientWebSocket*>(ws);
+        std::string helloMsg = "Hello from production client!";
+        std::cout << "📤 Sending initial message: " << helloMsg << std::endl;
+        clientWs->send(helloMsg, uWS::WebSocketFrame::TEXT);
     };
 
     auto messageHandler = [](void *ws, std::string_view message, int opCode) {
@@ -40,8 +42,10 @@ int main() {
         std::cout << "   OpCode: " << opCode << std::endl;
 
         // Echo the message back
-        auto *clientWs = static_cast<uWS::ClientWebSocket<false>*>(ws);
-        clientWs->send(std::string("Echo: ") + std::string(message), uWS::WebSocketFrame::TEXT);
+        auto *clientWs = static_cast<uWS::ClientWebSocket*>(ws);
+        std::string echoMsg = std::string("Echo: ") + std::string(message);
+        std::cout << "🔄 Echoing back: " << echoMsg << std::endl;
+        clientWs->send(echoMsg, uWS::WebSocketFrame::TEXT);
     };
 
     auto closeHandler = [](void *ws, int code, std::string_view message) {
@@ -62,10 +66,10 @@ int main() {
     behavior.close = closeHandler;
     behavior.failed = failedHandler;
 
-    uWS::ClientApp<false> app(std::move(behavior));
+    uWS::ClientApp app(std::move(behavior));
 
     // Connect to a WebSocket server
-    app.connect("ws://echo.websocket.org", "chat");
+    app.connect("ws://localhost:9001");
 
     if (app.isConnected()) {
         std::cout << "🔗 Connected successfully!" << std::endl;
@@ -78,8 +82,9 @@ int main() {
                 if (app.isConnected()) {
                     // In a real implementation, we'd check if the connection is alive
                     // and send pings if needed
-                    std::cout << "🔄 Sending keepalive ping..." << std::endl;
-                    app.sendMessage("ping");
+                    std::string pingMsg = "ping";
+                    std::cout << "🔄 Sending keepalive ping: " << pingMsg << std::endl;
+                    app.sendMessage(pingMsg);
                 }
             }
         });
@@ -94,7 +99,9 @@ int main() {
 
             // Send periodic messages if connected
             if (app.isConnected() && ++messageCounter % 50 == 0) { // Every ~5 seconds
-                app.sendMessage("Heartbeat message #" + std::to_string(messageCounter / 50));
+                std::string heartbeatMsg = "Heartbeat message #" + std::to_string(messageCounter / 50);
+                std::cout << "💓 Sending heartbeat: " << heartbeatMsg << std::endl;
+                app.sendMessage(heartbeatMsg);
             }
         }
 
@@ -106,3 +113,4 @@ int main() {
 
     return 0;
 }
+

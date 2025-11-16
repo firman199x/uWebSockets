@@ -8,6 +8,19 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <cstdlib>
+#include <errno.h>
+#include <algorithm>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#ifdef LIBUS_USE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
 #ifdef __SSE2__
 #include <emmintrin.h>
 #endif
@@ -17,773 +30,505 @@
 
 namespace uWS {
 
-    struct WebSocketClientBehavior {
-        MoveOnlyFunction<void(void *)> open;  // Simplified - void* instead of WebSocket*
-        MoveOnlyFunction<void(void *, std::string_view, int)> message;  // int instead of OpCode
-        MoveOnlyFunction<void(void *, int, std::string_view)> close;
-        MoveOnlyFunction<void()> failed;
-    };
+struct WebSocketClientBehavior {
+    MoveOnlyFunction<void(void *)> open;
+    MoveOnlyFunction<void(void *, std::string_view, int)> message;
+    MoveOnlyFunction<void(void *, int, std::string_view)> close;
+    MoveOnlyFunction<void()> failed;
+};
 
-    // Simple URL parser for WebSocket client
-    struct ParsedUrl {
-        std::string host;
-        std::string port;
-        std::string path;
-        bool ssl;
+struct ParsedUrl {
+    std::string host;
+    std::string port;
+    std::string path;
+    bool ssl;
 
-        static ParsedUrl parse(std::string_view url) {
-            ParsedUrl result;
-            // Check for wss:// prefix (SSL)
-            if (url.size() >= 6 && url.substr(0, 6) == "wss://") {
-                result.ssl = true;
-            } else if (url.size() >= 5 && url.substr(0, 5) == "ws://") {
-                result.ssl = false;
-            } else {
-                // Invalid URL
-                return result;
-            }
-
-            size_t start = result.ssl ? 6 : 5; // Skip "ws://" or "wss://"
-
-            size_t colonPos = url.find(':', start);
-            size_t slashPos = url.find('/', start);
-
-            if (colonPos != std::string_view::npos && (slashPos == std::string_view::npos || colonPos < slashPos)) {
-                // Has port
-                result.host = std::string(url.substr(start, colonPos - start));
-                size_t portEnd = slashPos != std::string_view::npos ? slashPos : url.size();
-                result.port = std::string(url.substr(colonPos + 1, portEnd - colonPos - 1));
-            } else {
-                // No port, use default
-                size_t hostEnd = slashPos != std::string_view::npos ? slashPos : url.size();
-                result.host = std::string(url.substr(start, hostEnd - start));
-                result.port = result.ssl ? "443" : "80";
-            }
-
-            result.path = slashPos != std::string_view::npos ? std::string(url.substr(slashPos)) : "/";
+    static ParsedUrl parse(std::string_view url) {
+        ParsedUrl result;
+        if (url.size() >= 6 && url.substr(0, 6) == "wss://") {
+            result.ssl = true;
+        } else if (url.size() >= 5 && url.substr(0, 5) == "ws://") {
+            result.ssl = false;
+        } else {
             return result;
         }
-    };
 
-    // Generate random Sec-WebSocket-Key
-    inline std::string generateWebSocketKey() {
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, 255);
+        size_t start = result.ssl ? 6 : 5;
+        size_t colonPos = url.find(':', start);
+        size_t slashPos = url.find('/', start);
 
-        std::string key;
-        for (int i = 0; i < 16; ++i) {
-            key += static_cast<char>(dis(gen));
+        if (colonPos != std::string_view::npos && (slashPos == std::string_view::npos || colonPos < slashPos)) {
+            result.host = std::string(url.substr(start, colonPos - start));
+            size_t portEnd = slashPos != std::string_view::npos ? slashPos : url.size();
+            result.port = std::string(url.substr(colonPos + 1, portEnd - colonPos - 1));
+        } else {
+            size_t hostEnd = slashPos != std::string_view::npos ? slashPos : url.size();
+            result.host = std::string(url.substr(start, hostEnd - start));
+            result.port = result.ssl ? "443" : "80";
         }
 
-        // Base64 encode (simplified implementation)
-        static const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::string encoded;
-        int val = 0, valb = -6;
-        for (unsigned char c : key) {
-            val = (val << 8) + c;
-            valb += 8;
-            while (valb >= 0) {
-                encoded.push_back(base64_chars[(val >> valb) & 0x3F]);
-                valb -= 6;
-                val &= 0x3FFFFFFF;
-            }
-        }
-        if (valb > -6) encoded.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
-        while (encoded.size() % 4) encoded.push_back('=');
-        return encoded;
+        result.path = slashPos != std::string_view::npos ? std::string(url.substr(slashPos)) : "/";
+        return result;
+    }
+};
+
+inline std::string generateWebSocketKey() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+
+    std::string key;
+    for (int i = 0; i < 16; ++i) {
+        key += static_cast<char>(dis(gen));
     }
 
-    // Production-ready WebSocket frame parser/encoder with SIMD optimizations
-    class WebSocketFrame {
-    public:
-        enum OpCode {
-            CONTINUATION = 0,
-            TEXT = 1,
-            BINARY = 2,
-            CLOSE = 8,
-            PING = 9,
-            PONG = 10
-        };
-
-        // Zero-copy encoding with external buffer
-        static size_t encodeToBuffer(std::string_view message, OpCode opCode, bool fin,
-                                   char *buffer, size_t bufferSize, unsigned char maskKey[4]) {
-            size_t requiredSize = getEncodedSize(message.size());
-            if (requiredSize > bufferSize) return 0; // Buffer too small
-
-            char *ptr = buffer;
-
-            // First byte: FIN + opcode
-            *ptr++ = static_cast<char>((fin ? 0x80 : 0x00) | static_cast<unsigned char>(opCode));
-
-            // Second byte: MASK + length
-            size_t length = message.size();
-            if (length <= 125) {
-                *ptr++ = static_cast<char>(length | 0x80);
-            } else if (length <= 65535) {
-                *ptr++ = static_cast<char>(126 | 0x80);
-                *ptr++ = static_cast<char>((length >> 8) & 0xFF);
-                *ptr++ = static_cast<char>(length & 0xFF);
-            } else {
-                *ptr++ = static_cast<char>(127 | 0x80);
-                for (int i = 7; i >= 0; --i) {
-                    *ptr++ = static_cast<char>((length >> (i * 8)) & 0xFF);
-                }
-            }
-
-            // Masking key
-            for (int i = 0; i < 4; ++i) {
-                *ptr++ = static_cast<char>(maskKey[i]);
-            }
-
-            // Masked payload with SIMD optimization
-            applyMaskSIMD(message.data(), ptr, length, maskKey);
-
-            return requiredSize;
+    static const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    int val = 0, valb = -6;
+    for (char c : key) {
+        val = (val << 8) + static_cast<unsigned char>(c);
+        valb += 8;
+        while (valb >= 0) {
+            encoded.push_back(base64_chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+            val &= 0x3FFFFFFF;
         }
+    }
+    if (valb > -6) encoded.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (encoded.size() % 4) encoded.push_back('=');
+    return encoded;
+}
 
-        // Legacy method for compatibility
-        static std::string encode(std::string_view message, OpCode opCode = TEXT, bool fin = true) {
-            unsigned char maskKey[4];
-            generateMaskKey(maskKey);
-
-            size_t size = getEncodedSize(message.size());
-            std::string frame(size, '\0');
-
-            size_t actualSize = encodeToBuffer(message, opCode, fin, frame.data(), size, maskKey);
-            if (actualSize == 0) return std::string(); // Error
-
-            frame.resize(actualSize);
-            return frame;
-        }
-
-        // Zero-copy decoding
-        static bool decodeZeroCopy(const char *data, size_t size, OpCode &outOpCode, bool &outFin,
-                                 size_t &outPayloadOffset, size_t &outPayloadLength, const unsigned char *&outMask) {
-            if (size < 2) return false;
-
-            // First byte
-            unsigned char firstByte = static_cast<unsigned char>(data[0]);
-            outFin = (firstByte & 0x80) != 0;
-            outOpCode = static_cast<OpCode>(firstByte & 0x0F);
-
-            // Second byte
-            unsigned char secondByte = static_cast<unsigned char>(data[1]);
-            bool masked = (secondByte & 0x80) != 0;
-            size_t length = secondByte & 0x7F;
-
-            size_t headerSize = 2;
-            if (length == 126) {
-                if (size < 4) return false;
-                length = (static_cast<unsigned char>(data[2]) << 8) | static_cast<unsigned char>(data[3]);
-                headerSize = 4;
-            } else if (length == 127) {
-                if (size < 10) return false;
-                length = 0;
-                for (int i = 0; i < 8; ++i) {
-                    length = (length << 8) | static_cast<unsigned char>(data[2 + i]);
-                }
-                headerSize = 10;
-            }
-
-            if (masked) {
-                if (size < headerSize + 4) return false;
-                outMask = reinterpret_cast<const unsigned char *>(data + headerSize);
-                headerSize += 4;
-            } else {
-                outMask = nullptr;
-            }
-
-            if (size < headerSize + length) return false;
-
-            outPayloadOffset = headerSize;
-            outPayloadLength = length;
-            return true;
-        }
-
-        // Legacy decode method
-        static bool decode(const char *data, size_t size, std::string &outMessage, OpCode &outOpCode, bool &outFin) {
-            OpCode opCode;
-            bool fin;
-            size_t payloadOffset, payloadLength;
-            const unsigned char *mask;
-
-            if (!decodeZeroCopy(data, size, opCode, fin, payloadOffset, payloadLength, mask)) {
-                return false;
-            }
-
-            outOpCode = opCode;
-            outFin = fin;
-
-            outMessage.clear();
-            outMessage.reserve(payloadLength);
-
-            if (mask) {
-                // Apply mask during copy
-                for (size_t i = 0; i < payloadLength; ++i) {
-                    outMessage.push_back(data[payloadOffset + i] ^ mask[i % 4]);
-                }
-            } else {
-                outMessage.assign(data + payloadOffset, payloadLength);
-            }
-
-            return true;
-        }
-
-        // Utility functions
-        static size_t getEncodedSize(size_t payloadSize) {
-            size_t headerSize = 2; // Base header
-            if (payloadSize <= 125) {
-                // No extra length bytes
-            } else if (payloadSize <= 65535) {
-                headerSize += 2; // 16-bit length
-            } else {
-                headerSize += 8; // 64-bit length
-            }
-            headerSize += 4; // Mask key
-            return headerSize + payloadSize;
-        }
-
-        static void generateMaskKey(unsigned char maskKey[4]) {
-            // Use thread-local random for better performance
-            static thread_local std::mt19937 gen(std::random_device{}());
-            std::uniform_int_distribution<unsigned char> dis(0, 255);
-            for (int i = 0; i < 4; ++i) {
-                maskKey[i] = dis(gen);
-            }
-        }
-
-    private:
-        // SIMD-optimized masking (fallback to scalar if SIMD not available)
-        static void applyMaskSIMD(const char *input, char *output, size_t length, const unsigned char mask[4]) {
-            size_t i = 0;
-
-            // Process 32 bytes at a time with AVX2
-            #ifdef __AVX2__
-            __m256i mask256 = _mm256_set_epi8(
-                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
-                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
-                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
-                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0]
-            );
-            for (; i + 32 <= length; i += 32) {
-                __m256i data = _mm256_loadu_si256((__m256i*)(input + i));
-                __m256i masked = _mm256_xor_si256(data, mask256);
-                _mm256_storeu_si256((__m256i*)(output + i), masked);
-            }
-            #endif
-
-            // Process 16 bytes at a time with SSE2
-            #ifdef __SSE2__
-            __m128i mask128 = _mm_set_epi8(
-                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
-                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0]
-            );
-            for (; i + 16 <= length; i += 16) {
-                __m128i data = _mm_loadu_si128((__m128i*)(input + i));
-                __m128i masked = _mm_xor_si128(data, mask128);
-                _mm_storeu_si128((__m128i*)(output + i), masked);
-            }
-            #endif
-
-            // Fallback: optimized scalar version
-            // Process in chunks of 4 bytes for better cache performance
-            for (; i + 4 <= length; i += 4) {
-                output[i] = input[i] ^ mask[0];
-                output[i + 1] = input[i + 1] ^ mask[1];
-                output[i + 2] = input[i + 2] ^ mask[2];
-                output[i + 3] = input[i + 3] ^ mask[3];
-            }
-
-            // Handle remaining bytes
-            for (; i < length; ++i) {
-                output[i] = input[i] ^ mask[i % 4];
-            }
-        }
+class WebSocketFrame {
+public:
+    enum OpCode {
+        CONTINUATION = 0,
+        TEXT = 1,
+        BINARY = 2,
+        CLOSE = 8,
+        PING = 9,
+        PONG = 10
     };
 
-    // Production-ready WebSocket client with proper networking
-    template <bool SSL>
-    class ClientWebSocket {
-        template <bool> friend struct ClientApp;
+    static std::string encode(std::string_view message, OpCode opCode = TEXT, bool fin = true) {
+        std::string frame;
+        char header[14];
+        size_t headerSize = 2;
+        size_t length = message.size();
 
-    private:
-        WebSocketClientBehavior *behavior;
-        void *socket = nullptr; // Using void* to avoid uSockets dependency
-        bool connected = false;
-        std::vector<char> sendBuffer;
-        std::vector<char> receiveBuffer;
-        size_t readOffset = 0;
-        unsigned char currentMask[4];
-
-        // Fragmentation support
-        std::vector<char> fragmentBuffer;
-        WebSocketFrame::OpCode fragmentOpCode;
-        bool inFragment = false;
-
-        // Connection state
-        enum State {
-            CONNECTING,
-            HANDSHAKE,
-            CONNECTED,
-            CLOSING,
-            CLOSED
-        } state = CLOSED;
-
-        // For ping/pong handling
-        std::chrono::steady_clock::time_point lastPingTime;
-        std::chrono::steady_clock::time_point lastPongTime;
-
-    public:
-        ClientWebSocket(WebSocketClientBehavior *behavior) : behavior(behavior) {
-            WebSocketFrame::generateMaskKey(currentMask);
-            lastPongTime = std::chrono::steady_clock::now();
-        }
-
-        ~ClientWebSocket() {
-            close(1000, "Client shutdown");
-        }
-
-        // Send methods with backpressure handling and fragmentation support
-        bool send(std::string_view message, WebSocketFrame::OpCode opCode = WebSocketFrame::TEXT, bool compress = false) {
-            if (state != CONNECTED) return false;
-
-            // Handle fragmentation for large messages
-            const size_t maxFrameSize = 32768; // 32KB fragments
-            if (message.size() <= maxFrameSize) {
-                return sendFrame(message, opCode, true, compress);
-            } else {
-                // Fragment the message
-                size_t offset = 0;
-                bool isFirst = true;
-
-                while (offset < message.size()) {
-                    size_t chunkSize = std::min(maxFrameSize, message.size() - offset);
-                    std::string_view chunk = message.substr(offset, chunkSize);
-
-                    WebSocketFrame::OpCode frameOpCode = isFirst ? opCode : WebSocketFrame::CONTINUATION;
-                    bool fin = (offset + chunkSize) >= message.size();
-
-                    if (!sendFrame(chunk, frameOpCode, fin, compress && isFirst)) {
-                        return false;
-                    }
-
-                    offset += chunkSize;
-                    isFirst = false;
-                }
-                return true;
+        header[0] = static_cast<char>((fin ? 0x80 : 0x00) | static_cast<unsigned char>(opCode));
+        if (length <= 125) {
+            header[1] = static_cast<char>(length | 0x80);
+        } else if (length <= 65535) {
+            header[1] = static_cast<char>(126 | 0x80);
+            header[2] = static_cast<char>((length >> 8) & 0xFF);
+            header[3] = static_cast<char>(length & 0xFF);
+            headerSize = 4;
+        } else {
+            header[1] = static_cast<char>(127 | 0x80);
+            for (int i = 0; i < 8; ++i) {
+                header[2 + i] = static_cast<char>((length >> (56 - i * 8)) & 0xFF);
             }
+            headerSize = 10;
         }
 
-    private:
-        bool sendFrame(std::string_view message, WebSocketFrame::OpCode opCode, bool fin, bool compress) {
-            // Reserve space in send buffer
-            size_t frameSize = WebSocketFrame::getEncodedSize(message.size());
-            if (sendBuffer.capacity() < sendBuffer.size() + frameSize) {
-                sendBuffer.reserve(sendBuffer.size() + frameSize + 4096); // Extra padding
+        unsigned char maskKey[4];
+        generateMaskKey(maskKey);
+        for (int i = 0; i < 4; ++i) {
+            header[headerSize++] = static_cast<char>(maskKey[i]);
+        }
+
+        frame.resize(getEncodedSize(length));
+        memcpy(frame.data(), header, headerSize);
+        memcpy(frame.data() + headerSize, message.data(), length);
+        maskData(frame.data() + headerSize, length, maskKey);
+
+        return frame;
+    }
+
+    static size_t decode(const char *data, size_t size, std::string &outMessage, OpCode &outOpCode, bool &outFin) {
+        if (size < 2) return 0;
+
+        unsigned char firstByte = static_cast<unsigned char>(data[0]);
+        outFin = (firstByte & 0x80) != 0;
+        outOpCode = static_cast<OpCode>(firstByte & 0x0F);
+
+        unsigned char secondByte = static_cast<unsigned char>(data[1]);
+        bool masked = (secondByte & 0x80) != 0;
+        size_t length = secondByte & 0x7F;
+
+        size_t headerSize = 2;
+        if (length == 126) {
+            if (size < 4) return 0;
+            length = (static_cast<unsigned char>(data[2]) << 8) | static_cast<unsigned char>(data[3]);
+            headerSize = 4;
+        } else if (length == 127) {
+            if (size < 10) return 0;
+            length = 0;
+            for (int i = 0; i < 8; ++i) {
+                length = (length << 8) | static_cast<unsigned char>(data[2 + i]);
             }
-
-            // Encode frame directly into send buffer
-            size_t offset = sendBuffer.size();
-            sendBuffer.resize(offset + frameSize);
-
-            size_t actualSize = WebSocketFrame::encodeToBuffer(message, opCode, fin,
-                                                             sendBuffer.data() + offset, frameSize, currentMask);
-            if (actualSize == 0) {
-                sendBuffer.resize(offset); // Revert on error
-                return false;
-            }
-
-            sendBuffer.resize(offset + actualSize);
-
-            // Generate new mask key for next frame
-            WebSocketFrame::generateMaskKey(currentMask);
-
-            // Try to send immediately, buffer if needed
-            return flushSendBuffer();
+            headerSize = 10;
         }
 
-        void close(int code = 1000, std::string_view message = "") {
-            if (state == CONNECTED) {
-                state = CLOSING;
-
-                // Send close frame
-                uint16_t networkCode = (code >> 8) | (code << 8); // Convert to network byte order
-                std::string closePayload;
-                closePayload.append(reinterpret_cast<const char*>(&networkCode), 2);
-                closePayload.append(message.data(), message.size());
-
-                send(closePayload, WebSocketFrame::CLOSE);
-            } else if (state == CLOSING) {
-                state = CLOSED;
-                connected = false;
-                if (behavior && behavior->close) {
-                    behavior->close(this, code, message);
-                }
-            }
+        if (masked) {
+            if (size < headerSize + 4 + length) return 0;
+            const unsigned char *mask = reinterpret_cast<const unsigned char *>(data + headerSize);
+            headerSize += 4;
+            outMessage.resize(length);
+            memcpy(outMessage.data(), data + headerSize, length);
+            maskData(outMessage.data(), length, mask);
+        } else {
+            if (size < headerSize + length) return 0;
+            outMessage.assign(data + headerSize, length);
         }
 
-        // Networking integration methods
-        void setSocket(void *s) { socket = s; }
-        void *getSocket() const { return socket; }
+        return headerSize + length;
+    }
 
-        bool isConnected() const { return connected; }
-        void setConnected(bool c) {
-            connected = c;
-            state = c ? CONNECTED : CLOSED;
-            if (c && behavior && behavior->open) {
-                behavior->open(this);
-            }
+    static size_t getEncodedSize(size_t payloadSize) {
+        size_t headerSize = 2;
+        if (payloadSize <= 125) {
+        } else if (payloadSize <= 65535) {
+            headerSize += 2;
+        } else {
+            headerSize += 8;
         }
+        headerSize += 4; // mask
+        return headerSize + payloadSize;
+    }
 
-        State getState() const { return state; }
-        void setState(State s) { state = s; }
-
-        // Buffer management
-        bool flushSendBuffer() {
-            if (sendBuffer.empty()) return true;
-
-            // In a real implementation, this would use us_socket_write
-            // For now, simulate sending
-            std::cout << "Flushing " << sendBuffer.size() << " bytes from send buffer" << std::endl;
-            sendBuffer.clear();
-            return true;
+private:
+    static void maskData(char *data, size_t length, const unsigned char mask[4]) {
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256i avxMaskVec = _mm256_set_epi8(
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0])
+        );
+        for (; i + 31 < length; i += 32) {
+            __m256i dataVec = _mm256_loadu_si256(reinterpret_cast<__m256i*>(data + i));
+            __m256i masked = _mm256_xor_si256(dataVec, avxMaskVec);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(data + i), masked);
         }
-
-        void appendReceiveData(const char *data, size_t length) {
-            receiveBuffer.insert(receiveBuffer.end(), data, data + length);
-            processReceiveBuffer();
+#endif
+#ifdef __SSE2__
+        __m128i sseMaskVec = _mm_set_epi8(
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0]),
+            static_cast<char>(mask[3]), static_cast<char>(mask[2]), static_cast<char>(mask[1]), static_cast<char>(mask[0])
+        );
+        for (; i + 15 < length; i += 16) {
+            __m128i dataVec = _mm_loadu_si128(reinterpret_cast<__m128i*>(data + i));
+            __m128i masked = _mm_xor_si128(dataVec, sseMaskVec);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(data + i), masked);
         }
-
-        void processReceiveBuffer() {
-            size_t offset = readOffset;
-
-            while (offset < receiveBuffer.size()) {
-                WebSocketFrame::OpCode opCode;
-                bool fin;
-                size_t payloadOffset, payloadLength;
-                const unsigned char *mask;
-
-                if (!WebSocketFrame::decodeZeroCopy(receiveBuffer.data() + offset,
-                                                  receiveBuffer.size() - offset,
-                                                  opCode, fin, payloadOffset, payloadLength, mask)) {
-                    break; // Need more data
-                }
-
-                // Handle frame with fragmentation support
-                if (!handleFrameFragmented(opCode, fin, receiveBuffer.data() + offset + payloadOffset, payloadLength, mask)) {
-                    break; // Frame not complete
-                }
-
-                // Move to next frame
-                size_t frameSize = payloadOffset + payloadLength;
-                offset += frameSize;
-            }
-
-            readOffset = offset;
-            // Compact buffer if more than half is processed
-            if (readOffset > receiveBuffer.size() / 2 && readOffset > 0) {
-                std::copy(receiveBuffer.begin() + readOffset, receiveBuffer.end(), receiveBuffer.begin());
-                receiveBuffer.resize(receiveBuffer.size() - readOffset);
-                readOffset = 0;
-            }
+#endif
+        for (; i < length; ++i) {
+            data[i] ^= static_cast<char>(mask[i % 4]);
         }
+    }
 
-        bool handleFrameFragmented(WebSocketFrame::OpCode opCode, bool fin,
-                                  const char *payload, size_t length, const unsigned char *mask) {
-            std::vector<char> message;
+    static void generateMaskKey(unsigned char maskKey[4]) {
+        static thread_local std::mt19937 gen(std::random_device{}());
+        std::uniform_int_distribution<unsigned char> dis(0, 255);
+        for (int i = 0; i < 4; ++i) {
+            maskKey[i] = dis(gen);
+        }
+    }
+};
 
-            // Unmask if necessary
-            if (mask) {
-                message.resize(length);
-                for (size_t i = 0; i < length; ++i) {
-                    message[i] = payload[i] ^ mask[i % 4];
+class ClientWebSocket {
+private:
+    WebSocketClientBehavior *behavior;
+    int socket_fd;
+#ifdef LIBUS_USE_OPENSSL
+    SSL *ssl;
+#endif
+    bool connected = false;
+    std::vector<char> sendBuffer;
+    std::vector<char> receiveBuffer;
+    size_t readOffset = 0;
+
+public:
+    ClientWebSocket(WebSocketClientBehavior *b, int fd, void * /*s*/) : behavior(b), socket_fd(fd)
+#ifdef LIBUS_USE_OPENSSL
+    , ssl(static_cast<SSL*>(s))
+#endif
+    {}
+
+    void send(std::string_view message, WebSocketFrame::OpCode opCode = WebSocketFrame::TEXT) {
+        std::string frame = WebSocketFrame::encode(message, opCode);
+        sendBuffer.insert(sendBuffer.end(), frame.begin(), frame.end());
+        flushSendBuffer();
+    }
+
+    void processData(char *data, int length) {
+        receiveBuffer.insert(receiveBuffer.end(), data, data + length);
+        processReceiveBuffer();
+    }
+
+    void setConnected(bool c) { connected = c; }
+    bool isConnected() const { return connected; }
+
+private:
+    void flushSendBuffer() {
+        if (!sendBuffer.empty() && socket_fd >= 0) {
+#ifdef LIBUS_USE_OPENSSL
+            if (ssl) {
+                ssize_t written = SSL_write(ssl, sendBuffer.data(), static_cast<int>(sendBuffer.size()));
+                if (written > 0) {
+                    sendBuffer.erase(sendBuffer.begin(), sendBuffer.begin() + written);
                 }
             } else {
-                message.assign(payload, payload + length);
+#endif
+                ssize_t written = write(socket_fd, sendBuffer.data(), sendBuffer.size());
+                if (written > 0) {
+                    sendBuffer.erase(sendBuffer.begin(), sendBuffer.begin() + written);
+                }
+#ifdef LIBUS_USE_OPENSSL
             }
-
-            // Handle fragmentation
-            if (opCode == WebSocketFrame::CONTINUATION) {
-                if (!inFragment) {
-                    // Unexpected continuation frame
-                    close(1002, "Unexpected continuation frame");
-                    return false;
-                }
-                fragmentBuffer.insert(fragmentBuffer.end(), message.begin(), message.end());
-            } else {
-                if (inFragment) {
-                    // Previous fragment not finished
-                    close(1002, "Fragment not finished");
-                    return false;
-                }
-
-                if (!fin) {
-                    // Start new fragment
-                    inFragment = true;
-                    fragmentOpCode = opCode;
-                    fragmentBuffer = std::move(message);
-                    return true; // Wait for more fragments
-                } else {
-                    // Single frame message
-                    fragmentOpCode = opCode;
-                    fragmentBuffer = std::move(message);
-                }
-            }
-
-            if (fin) {
-                // Message complete
-                inFragment = false;
-                handleCompleteMessage(fragmentOpCode, fragmentBuffer);
-                fragmentBuffer.clear();
-            }
-
-            return true;
+#endif
         }
+    }
 
-        void handleCompleteMessage(WebSocketFrame::OpCode opCode, const std::vector<char>& message) {
-            handleFrame(opCode, true, message.data(), message.size(), nullptr);
-        }
-
-        // Ping/pong for keepalive
-        void sendPing(std::string_view data = "") {
-            if (state == CONNECTED) {
-                send(data, WebSocketFrame::PING);
-                lastPingTime = std::chrono::steady_clock::now();
-            }
-        }
-
-        bool isAlive(int timeoutMs = 30000) {
-            auto now = std::chrono::steady_clock::now();
-            auto timeSincePong = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPongTime);
-            return timeSincePong.count() < timeoutMs;
-        }
-
-    private:
-        void handleFrame(WebSocketFrame::OpCode opCode, bool fin, const char *payload, size_t length, const unsigned char *mask) {
-            switch (opCode) {
-                case WebSocketFrame::TEXT:
-                case WebSocketFrame::BINARY: {
-                    if (behavior && behavior->message) {
-                        std::string message;
-                        if (mask) {
-                            message.reserve(length);
-                            for (size_t i = 0; i < length; ++i) {
-                                message.push_back(payload[i] ^ mask[i % 4]);
-                            }
-                        } else {
-                            message.assign(payload, length);
-                        }
-                        behavior->message(this, message, static_cast<int>(opCode));
-                    }
-                    break;
-                }
-                case WebSocketFrame::CLOSE: {
-                    int closeCode = 1000; // Default
-                    std::string closeMessage;
-
-                    if (length >= 2) {
-                        closeCode = (static_cast<unsigned char>(payload[0]) << 8) |
-                                   static_cast<unsigned char>(payload[1]);
-                        if (mask) {
-                            closeCode ^= (mask[0] << 8) | mask[1];
-                        }
-
-                        if (length > 2) {
-                            closeMessage.assign(payload + 2, length - 2);
-                            if (mask) {
-                                for (size_t i = 0; i < closeMessage.size(); ++i) {
-                                    closeMessage[i] ^= mask[(i + 2) % 4];
-                                }
-                            }
-                        }
-                    }
-
-                    close(closeCode, closeMessage);
-                    break;
-                }
-                case WebSocketFrame::PING: {
-                    // Send pong with same payload
-                    std::string_view pingData(payload, length);
-                    if (mask) {
-                        std::string unmaskedPayload;
-                        unmaskedPayload.reserve(length);
-                        for (size_t i = 0; i < length; ++i) {
-                            unmaskedPayload.push_back(payload[i] ^ mask[i % 4]);
-                        }
-                        send(unmaskedPayload, WebSocketFrame::PONG);
-                    } else {
-                        send(pingData, WebSocketFrame::PONG);
-                    }
-                    break;
-                }
-                case WebSocketFrame::PONG: {
-                    lastPongTime = std::chrono::steady_clock::now();
-                    break;
-                }
-                default:
-                    // Ignore unknown frames
-                    break;
-            }
-        }
-    };
-
-    template <bool SSL = false>
-    struct ClientApp {
-        // SSL/TLS configuration for secure connections
-        struct SSLConfig {
-            std::string cert_file;
-            std::string key_file;
-            std::string ca_file;
-            bool verify_peer = true;
-        };
-    private:
-        WebSocketClientBehavior behavior;
-        std::string protocol;
-        ParsedUrl parsedUrl;
-        std::string webSocketKey;
-        ClientWebSocket<SSL> *webSocket = nullptr;
-        SSLConfig sslConfig;
-
-        void sendUpgradeRequest() {
-            std::ostringstream request;
-            request << "GET " << parsedUrl.path << " HTTP/1.1\r\n";
-            request << "Host: " << parsedUrl.host << ":" << parsedUrl.port << "\r\n";
-            request << "Upgrade: websocket\r\n";
-            request << "Connection: Upgrade\r\n";
-            request << "Sec-WebSocket-Key: " << webSocketKey << "\r\n";
-            request << "Sec-WebSocket-Version: 13\r\n";
-            if (!protocol.empty()) {
-                request << "Sec-WebSocket-Protocol: " << protocol << "\r\n";
-            }
-            request << "\r\n";
-
-            std::string requestStr = request.str();
-            std::cout << "Sending upgrade request:\n" << requestStr << std::endl;
-        }
-
-        void handleHttpResponse(const std::string &response) {
-            // Parse HTTP response
-            if (response.find("101 Switching Protocols") != std::string::npos &&
-                response.find("Upgrade: websocket") != std::string::npos &&
-                response.find("Connection: Upgrade") != std::string::npos) {
-
-                std::cout << "WebSocket upgrade successful!" << std::endl;
-                webSocket = new ClientWebSocket<SSL>(&behavior);
-                webSocket->setConnected(true);
-
-                if (behavior.open) {
-                    behavior.open(webSocket);
-                }
-            } else {
-                std::cout << "WebSocket upgrade failed!" << std::endl;
-                if (behavior.failed) {
-                    behavior.failed();
-                }
-            }
-        }
-
-        void handleWebSocketFrame(const char *data, size_t size) {
+    void processReceiveBuffer() {
+        size_t offset = readOffset;
+        while (offset < receiveBuffer.size()) {
             std::string message;
             WebSocketFrame::OpCode opCode;
             bool fin;
-
-            if (WebSocketFrame::decode(data, size, message, opCode, fin)) {
-                if (behavior.message && webSocket) {
-                    behavior.message(webSocket, message, static_cast<int>(opCode));
+            size_t consumed = WebSocketFrame::decode(receiveBuffer.data() + offset, receiveBuffer.size() - offset, message, opCode, fin);
+            if (consumed) {
+                offset += consumed;
+                if (behavior && behavior->message) {
+                    behavior->message(this, message, (int)opCode);
                 }
-            }
-        }
-
-    public:
-        ClientApp(WebSocketClientBehavior &&behavior)
-            : behavior(std::move(behavior)) {
-            webSocketKey = generateWebSocketKey();
-        }
-
-        ~ClientApp() {
-            if (webSocket) {
-                delete webSocket;
-            }
-        }
-
-        // Configure SSL/TLS settings
-        ClientApp &&ssl(SSLConfig config) {
-            if constexpr (SSL) {
-                sslConfig = std::move(config);
             } else {
-                std::cout << "Warning: SSL configuration ignored for non-SSL client" << std::endl;
-            }
-            return std::move(*this);
-        }
-
-        ClientApp &&connect(std::string url, std::string protocol = "") {
-            this->protocol = protocol;
-            parsedUrl = ParsedUrl::parse(url);
-
-            if (parsedUrl.host.empty()) {
-                std::cout << "Invalid WebSocket URL: " << url << std::endl;
-                if (behavior.failed) {
-                    behavior.failed();
-                }
-                return std::move(*this);
-            }
-
-            // Validate SSL requirements
-            if (parsedUrl.ssl && !SSL) {
-                std::cout << "Error: wss:// URL requires SSL-enabled client" << std::endl;
-                if (behavior.failed) {
-                    behavior.failed();
-                }
-                return std::move(*this);
-            }
-
-            std::cout << "Connecting to " << parsedUrl.host << ":" << parsedUrl.port << parsedUrl.path;
-            if (parsedUrl.ssl) {
-                std::cout << " (SSL/TLS)";
-            }
-            std::cout << std::endl;
-
-            // In a real implementation, this would establish a TCP/TLS connection
-            // For now, we'll simulate the connection process
-            sendUpgradeRequest();
-
-            // Simulate receiving upgrade response
-            std::string simulatedResponse =
-                "HTTP/1.1 101 Switching Protocols\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Accept: " + webSocketKey + "\r\n"
-                "\r\n";
-
-            handleHttpResponse(simulatedResponse);
-
-            return std::move(*this);
-        }
-
-        void run() {
-            // In a real implementation, this would run the event loop
-            std::cout << "Client running..." << std::endl;
-
-            // Simulate receiving a message
-            if (webSocket && webSocket->isConnected()) {
-                std::string testMessage = "Hello from server!";
-                std::string frame = WebSocketFrame::encode(testMessage, WebSocketFrame::TEXT);
-                handleWebSocketFrame(frame.data(), frame.size());
+                break;
             }
         }
+        readOffset = offset;
+        if (readOffset > receiveBuffer.size() / 2) {
+            receiveBuffer.erase(receiveBuffer.begin(), receiveBuffer.begin() + static_cast<ptrdiff_t>(readOffset));
+            readOffset = 0;
+        }
+    }
+};
 
-        bool isConnected() const {
-            return webSocket && webSocket->isConnected();
+class ClientApp {
+private:
+    WebSocketClientBehavior behavior;
+    ClientWebSocket *ws = nullptr;
+    int socket_fd = -1;
+    void *ssl = nullptr;
+#ifdef LIBUS_USE_OPENSSL
+    SSL_CTX *ssl_ctx = nullptr;
+#endif
+    bool connected = false;
+    std::string host, port, path;
+    bool use_ssl = false;
+
+public:
+    ClientApp(WebSocketClientBehavior &&b) : behavior(std::move(b)) {}
+
+    ~ClientApp() {
+        disconnect();
+#ifdef LIBUS_USE_OPENSSL
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+#endif
+    }
+
+    bool connect(std::string url) {
+        ParsedUrl parsed = ParsedUrl::parse(url);
+        if (parsed.host.empty()) return false;
+
+        host = parsed.host;
+        port = parsed.port;
+        path = parsed.path;
+        use_ssl = parsed.ssl;
+
+        // Create socket
+        socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_fd < 0) return false;
+
+        // Set non-blocking
+        fcntl(socket_fd, F_SETFL, O_NONBLOCK);
+
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(static_cast<uint16_t>(std::stoi(port)));
+        inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr);
+
+        if (::connect(socket_fd, (sockaddr*)&server_addr, sizeof(server_addr)) < 0 && errno != EINPROGRESS) {
+            close(socket_fd);
+            socket_fd = -1;
+            return false;
         }
 
-        // Method to send messages (for testing)
-        void sendMessage(std::string_view message) {
-            if (webSocket) {
-                webSocket->send(message);
+        // Wait for connection
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        FD_SET(socket_fd, &writefds);
+        struct timeval tv = {5, 0}; // 5 second timeout
+        if (select(socket_fd + 1, nullptr, &writefds, nullptr, &tv) <= 0) {
+            close(socket_fd);
+            socket_fd = -1;
+            return false;
+        }
+
+        int error;
+        socklen_t len = sizeof(error);
+        getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &len);
+        if (error) {
+            close(socket_fd);
+            socket_fd = -1;
+            return false;
+        }
+
+        // Set blocking again for simplicity
+        fcntl(socket_fd, F_SETFL, 0);
+
+        // SSL setup if needed
+        if (use_ssl) {
+#ifdef LIBUS_USE_OPENSSL
+            SSL_library_init();
+            ssl_ctx = SSL_CTX_new(TLS_client_method());
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, nullptr);
+            if (!ssl_ctx) {
+                close(socket_fd);
+                socket_fd = -1;
+                return false;
             }
+            ssl = SSL_new(ssl_ctx);
+            SSL_set_fd(static_cast<SSL*>(ssl), socket_fd);
+            if (SSL_connect(static_cast<SSL*>(ssl)) != 1) {
+                SSL_free(static_cast<SSL*>(ssl));
+                ssl = nullptr;
+                SSL_CTX_free(ssl_ctx);
+                ssl_ctx = nullptr;
+                close(socket_fd);
+                socket_fd = -1;
+                return false;
+            }
+#else
+            // SSL not supported
+            close(socket_fd);
+            socket_fd = -1;
+            return false;
+#endif
         }
-    };
+
+        // WebSocket handshake
+        std::string key = generateWebSocketKey();
+        std::string handshake = "GET " + path + " HTTP/1.1\r\n"
+                                "Host: " + host + ":" + port + "\r\n"
+                                "Upgrade: websocket\r\n"
+                                "Connection: Upgrade\r\n"
+                                "Sec-WebSocket-Key: " + key + "\r\n"
+                                "Sec-WebSocket-Version: 13\r\n\r\n";
+
+#ifdef LIBUS_USE_OPENSSL
+        if (ssl) {
+            SSL_write(ssl, handshake.data(), static_cast<int>(handshake.size()));
+        } else
+#endif
+        {
+            write(socket_fd, handshake.data(), handshake.size());
+        }
+
+        // Read response
+        char buffer[4096];
+        ssize_t n;
+#ifdef LIBUS_USE_OPENSSL
+        if (ssl) {
+            n = SSL_read(static_cast<SSL*>(ssl), buffer, sizeof(buffer));
+        } else
+#endif
+        {
+            n = read(socket_fd, buffer, sizeof(buffer));
+        }
+        if (n <= 0) {
+            disconnect();
+            return false;
+        }
+
+        std::string response(buffer, static_cast<size_t>(n));
+        if (response.find("101 Switching Protocols") == std::string::npos) {
+            disconnect();
+            return false;
+        }
+
+        // Create WebSocket
+        ws = new ClientWebSocket(&behavior, socket_fd, ssl);
+        ws->setConnected(true);
+        connected = true;
+
+        if (behavior.open) {
+            behavior.open(ws);
+        }
+
+        return true;
+    }
+
+    void disconnect() {
+        if (ws) {
+            ws->setConnected(false);
+            delete ws;
+            ws = nullptr;
+        }
+#ifdef LIBUS_USE_OPENSSL
+        if (ssl) {
+            SSL_shutdown(static_cast<SSL*>(ssl));
+            SSL_free(static_cast<SSL*>(ssl));
+            ssl = nullptr;
+        }
+#endif
+        if (socket_fd >= 0) {
+            close(socket_fd);
+            socket_fd = -1;
+        }
+        connected = false;
+    }
+
+    bool isConnected() const { return connected; }
+
+    void sendMessage(std::string message) {
+        if (ws && connected) {
+            ws->send(message);
+        }
+    }
+
+    void run() {
+        if (!connected) return;
+
+        char buffer[4096];
+        ssize_t n;
+#ifdef LIBUS_USE_OPENSSL
+        if (ssl) {
+            n = SSL_read(static_cast<SSL*>(ssl), buffer, sizeof(buffer));
+        } else
+#endif
+        {
+            n = read(socket_fd, buffer, sizeof(buffer));
+        }
+        if (n > 0) {
+            ws->processData(buffer, static_cast<int>(n));
+        } else if (n == 0) {
+            // Connection closed
+            if (behavior.close) {
+                behavior.close(ws, 1000, "Connection closed");
+            }
+            disconnect();
+        }
+    }
+};
 
 }
