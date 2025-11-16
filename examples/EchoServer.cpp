@@ -1,5 +1,7 @@
 /* We simply call the root header file "App.h", giving you uWS::App and uWS::SSLApp */
 #include "App.h"
+#include <chrono>
+#include <iomanip>
 
 /* This is a simple WebSocket echo server example.
  * You may compile it with "WITH_OPENSSL=1 make" or with "make" */
@@ -30,7 +32,13 @@ int main() {
         },
         .message = [](auto *ws, std::string_view message, uWS::OpCode opCode) {
             /* Echo the message back */
+            auto recvTime = std::chrono::system_clock::now();
+            auto recv_t = std::chrono::system_clock::to_time_t(recvTime);
+            std::cout << "📨 Server received at " << std::put_time(std::gmtime(&recv_t), "%F %T") << ": " << message << std::endl;
             ws->send(message, opCode);
+            auto sendTime = std::chrono::system_clock::now();
+            auto send_t = std::chrono::system_clock::to_time_t(sendTime);
+            std::cout << "📤 Server sent reply at " << std::put_time(std::gmtime(&send_t), "%F %T") << std::endl;
         },
         .close = [](auto *ws, int code, std::string_view message) {
             /* You may access ws->getUserData() here */

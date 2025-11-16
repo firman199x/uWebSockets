@@ -78,6 +78,14 @@ int main() {
             std::cout << "📤 Queueing at " << std::put_time(std::gmtime(&send_t), "%F %T") << ": " << helloMsg << std::endl;
             client.sendMessage(helloMsg);
 
+            auto sent = 0;
+            while (sent < 10) {
+                auto msg = "Hello from production client! " + std::to_string(sent);
+                client.sendMessage(msg);
+                sent++;
+            }
+
+
             std::this_thread::sleep_for(std::chrono::seconds(20));
 
             std::cout << "👋 Shutting down gracefully..." << std::endl;
