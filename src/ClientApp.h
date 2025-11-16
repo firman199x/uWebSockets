@@ -7,6 +7,12 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 namespace uWS {
 
@@ -252,16 +258,32 @@ namespace uWS {
         static void applyMaskSIMD(const char *input, char *output, size_t length, const unsigned char mask[4]) {
             size_t i = 0;
 
-            // Process 32 bytes at a time (8 * 4-byte chunks) if possible
+            // Process 32 bytes at a time with AVX2
             #ifdef __AVX2__
-            // AVX2 version would go here for maximum performance
-            // For now, use 16-byte chunks with SSE2
+            __m256i mask256 = _mm256_set_epi8(
+                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
+                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
+                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
+                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0]
+            );
+            for (; i + 32 <= length; i += 32) {
+                __m256i data = _mm256_loadu_si256((__m256i*)(input + i));
+                __m256i masked = _mm256_xor_si256(data, mask256);
+                _mm256_storeu_si256((__m256i*)(output + i), masked);
+            }
             #endif
 
-            // Process 16 bytes at a time (4 * 4-byte chunks)
+            // Process 16 bytes at a time with SSE2
             #ifdef __SSE2__
-            // SSE2 version would go here
-            // For now, use optimized scalar version
+            __m128i mask128 = _mm_set_epi8(
+                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0],
+                mask[3], mask[2], mask[1], mask[0], mask[3], mask[2], mask[1], mask[0]
+            );
+            for (; i + 16 <= length; i += 16) {
+                __m128i data = _mm_loadu_si128((__m128i*)(input + i));
+                __m128i masked = _mm_xor_si128(data, mask128);
+                _mm_storeu_si128((__m128i*)(output + i), masked);
+            }
             #endif
 
             // Fallback: optimized scalar version
