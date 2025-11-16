@@ -30,6 +30,7 @@ int main() {
     };
 
     static std::chrono::system_clock::time_point sendTime;
+    static std::string sentData;
     auto messageHandler = [](void *ws, std::string_view message, int opCode) {
         if (opCode != 1 && opCode != 2) return; // Handle TEXT and BINARY messages
         auto recvTime = std::chrono::system_clock::now();
@@ -44,13 +45,24 @@ int main() {
         if (opCode == 1) {
             std::cout << message;
         } else {
-            std::cout << "[" << message.size() << " bytes]";
-            // For demo, print first 10 bytes in hex
-            std::cout << " First 10 bytes: ";
-            for (size_t i = 0; i < std::min(size_t(10), message.size()); ++i) {
-                std::cout << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)message[i] << " ";
+            std::cout << "[" << message.size() << " bytes]" << std::endl;
+            // Print sent data
+            std::cout << "Sent data (" << sentData.size() << " bytes): ";
+            for (size_t i = 0; i < sentData.size(); ++i) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)sentData[i] << " ";
+                if ((i + 1) % 16 == 0) std::cout << std::endl << "  ";
             }
-            std::cout << std::dec;
+            std::cout << std::dec << std::endl;
+            // Print received data
+            std::cout << "Received data (" << message.size() << " bytes): ";
+            for (size_t i = 0; i < message.size(); ++i) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0') << (unsigned char)message[i] << " ";
+                if ((i + 1) % 16 == 0) std::cout << std::endl << "  ";
+            }
+            std::cout << std::dec << std::endl;
+            // Verify match
+            bool match = (sentData.size() == message.size()) && (std::memcmp(sentData.data(), message.data(), message.size()) == 0);
+            std::cout << "Data match: " << (match ? "YES" : "NO") << std::endl;
         }
         if (elapsed_ms > 100) std::cout << " [SLOW]";
         std::cout << std::endl;
@@ -130,6 +142,7 @@ int main() {
             binaryData[i] = static_cast<char>(i % 256);
         }
         std::string binaryStr(binaryData.begin(), binaryData.end());
+        sentData = binaryStr; // Store for comparison
 
         sendTime = std::chrono::system_clock::now();
         auto send_us = std::chrono::duration_cast<std::chrono::microseconds>(sendTime.time_since_epoch()).count();
