@@ -545,10 +545,14 @@ public:
 
     bool isConnected() const { return connected; }
 
-    void sendMessage(std::string message) {
+    void sendMessage(std::string message, WebSocketFrame::OpCode opCode = WebSocketFrame::TEXT) {
         if (ws && connected) {
-            ws->send(message);
+            ws->send(message, opCode);
         }
+    }
+
+    void sendBinary(std::string message) {
+        sendMessage(std::move(message), WebSocketFrame::BINARY);
     }
 
     void run() {

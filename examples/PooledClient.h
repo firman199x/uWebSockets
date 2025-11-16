@@ -54,7 +54,7 @@ private:
         std::vector<std::unique_ptr<uWS::ClientApp>> clients;
         std::thread eventThread;
         std::atomic<bool> running{false};
-        std::queue<std::pair<size_t, std::string>> sendQueue;
+        std::queue<std::tuple<size_t, std::string, int>> sendQueue;
         std::mutex queueMutex;
         std::condition_variable queueCV;
         std::atomic<int> refCount{0};
@@ -63,7 +63,7 @@ private:
 
         size_t addClient(uWS::WebSocketClientBehavior&& behavior, const std::string& url);
         void removeClient(size_t index);
-        void queueSend(size_t index, const std::string& msg);
+        void queueSend(size_t index, const std::string& msg, int opCode = 1);
         bool isConnected(size_t index);
 
     private:
@@ -77,6 +77,7 @@ public:
     ~WebSocketClient();
 
     void sendMessage(const std::string& msg);
+    void sendBinary(const std::string& msg);
     bool isConnected() const;
 };
 
@@ -91,7 +92,11 @@ WebSocketClient::~WebSocketClient() {
 }
 
 void WebSocketClient::sendMessage(const std::string& msg) {
-    manager.queueSend(index, msg);
+    manager.queueSend(index, msg, 1);
+}
+
+void WebSocketClient::sendBinary(const std::string& msg) {
+    manager.queueSend(index, msg, 2);
 }
 
 bool WebSocketClient::isConnected() const {
@@ -126,9 +131,9 @@ void WebSocketClient::WebSocketManager::removeClient(size_t index) {
     }
 }
 
-void WebSocketClient::WebSocketManager::queueSend(size_t index, const std::string& msg) {
+void WebSocketClient::WebSocketManager::queueSend(size_t index, const std::string& msg, int opCode) {
     std::lock_guard<std::mutex> lock(queueMutex);
-    sendQueue.emplace(index, msg);
+    sendQueue.emplace(index, msg, opCode);
     queueCV.notify_one();
 }
 
@@ -153,10 +158,10 @@ void WebSocketClient::WebSocketManager::eventLoop() {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
             while (!sendQueue.empty()) {
-                auto [idx, msg] = sendQueue.front();
+                auto [idx, msg, opCode] = sendQueue.front();
                 sendQueue.pop();
                 if (idx < clients.size() && clients[idx]) {
-                    clients[idx]->sendMessage(msg);
+                    clients[idx]->sendMessage(msg, uWS::WebSocketFrame::OpCode(opCode));
                 }
             }
         }

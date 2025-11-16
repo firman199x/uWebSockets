@@ -32,7 +32,7 @@ int main() {
 
     static std::chrono::system_clock::time_point sendTime;
     auto messageHandler = [](void *ws, std::string_view message, int opCode) {
-        if (opCode != 1) return; // Only handle TEXT messages
+        if (opCode != 1 && opCode != 2) return; // Handle TEXT and BINARY messages
         auto recvTime = std::chrono::system_clock::now();
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(recvTime - sendTime).count();
         auto elapsed_ms = elapsed_us / 1000;
@@ -40,7 +40,13 @@ int main() {
         auto seconds = recv_us / 1000000;
         auto micros = recv_us % 1000000;
         std::time_t t = seconds;
-        std::cout << "📨 Received at " << std::put_time(std::gmtime(&t), "%F %T") << "." << std::setfill('0') << std::setw(6) << micros << " (" << elapsed_us << "us after send): " << message;
+        std::string type = (opCode == 1) ? "TEXT" : "BINARY";
+        std::cout << "📨 Received " << type << " at " << std::put_time(std::gmtime(&t), "%F %T") << "." << std::setfill('0') << std::setw(6) << micros << " (" << elapsed_us << "us after send): ";
+        if (opCode == 1) {
+            std::cout << message;
+        } else {
+            std::cout << "[" << message.size() << " bytes]";
+        }
         if (elapsed_ms > 100) std::cout << " [SLOW]";
         std::cout << std::endl;
         // Echoing would require access to the client instance, which we don't have here
