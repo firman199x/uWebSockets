@@ -8,12 +8,15 @@ int main() {
     std::cout << "HTTP Client Example - Async Interface" << std::endl;
     std::cout << "=====================================" << std::endl;
 
-    const int num_requests = 100000;
+    const int num_requests = 10;
     std::vector<std::future<uWS::HttpReply>> futures;
 
     // Start multiple async requests
     for (int i = 0; i < num_requests; ++i) {
-        futures.push_back(uWS::HttpClientPool::HttpRequest("GET", "http://127.0.0.1:8080/health"));
+        if (i == 5) 
+        futures.push_back(uWS::HttpClientPool::HttpRequest("GET", "http://localhost:8081/invalid"));
+        else
+        futures.push_back(uWS::HttpClientPool::HttpRequest("GET", "http://localhost:8080/health"));
     }
 
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -21,7 +24,7 @@ int main() {
     // Wait for all responses
     for (auto &f : futures) {
         auto reply = f.get();
-        std::cout << "reply: " << reply.body << "\n";
+        std::cout << reply.status_code << " reply: " << reply.body << "\n";
         // Process reply if needed
     }
 
