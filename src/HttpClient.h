@@ -18,25 +18,24 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <thread>
+#include <mutex>
+#include <atomic>
+#include <future>
 #include <unistd.h>
 #include <vector>
+#include <list>
 #ifdef LIBUS_USE_OPENSSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #endif
-#ifdef __SSE2__
-#include <emmintrin.h>
-#endif
-#ifdef __AVX2__
-#include <immintrin.h>
-#endif
 
 namespace uWS {
 
-struct HttpClientBehavior {
-    MoveOnlyFunction<void(void *, int, std::string_view, std::vector<std::pair<std::string_view, std::string_view>>)> response;
-    MoveOnlyFunction<void(void *, std::string_view, bool)> data;
-    MoveOnlyFunction<void()> failed;
+struct HttpReply {
+    int status_code;
+    std::string status_message;
+    std::vector<std::pair<std::string_view, std::string_view>> headers;
+    std::string body;
 };
 
 struct HttpParsedUrl {
@@ -81,13 +80,12 @@ struct HttpParsedUrl {
 };
 
 class HttpClient {
+public:
+    enum State { IDLE, CONNECTING, CONNECTED, REQUEST_SENT, READING, DONE };
 private:
-    HttpClientBehavior behavior;
+    std::function<void(HttpReply)> behavior;
     int socket_fd = -1;
     void *ssl = nullptr;
-#ifdef LIBUS_USE_OPENSSL
-    SSL_CTX *ssl_ctx = nullptr;
-#endif
     bool connected = false;
     std::string host, port, path;
     bool use_ssl = false;
@@ -96,18 +94,14 @@ private:
     std::string body;
     int redirect_count = 0;
     std::string redirect_url;
-    int max_retries = 3;
-    std::chrono::milliseconds base_retry_delay = std::chrono::milliseconds(1000);
+    State state = IDLE;
+    void *ssl_ctx = nullptr;
 
 public:
-    HttpClient(HttpClientBehavior &&b) : behavior(std::move(b)) {}
+    HttpClient(std::function<void(HttpReply)> b, void *ctx) : behavior(std::move(b)), ssl_ctx(ctx) {}
 
     ~HttpClient() {
         disconnect();
-#ifdef LIBUS_USE_OPENSSL
-        if (ssl_ctx)
-            SSL_CTX_free(ssl_ctx);
-#endif
     }
 
     void setMethod(std::string m) { method = std::move(m); }
@@ -124,24 +118,22 @@ public:
         path = parsed.path;
         use_ssl = parsed.ssl;
 
-        for (int attempt = 0; attempt <= max_retries; ++attempt) {
-            if (attempt > 0) {
-                std::chrono::milliseconds delay = base_retry_delay * (1LL << (attempt - 1));
-                std::this_thread::sleep_for(delay);
-            }
+        // Create socket
+        socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_fd < 0)
+            return false;
 
-            // Create socket
-            socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (socket_fd < 0)
-                continue;
+        // Set non-blocking
+        fcntl(socket_fd, F_SETFL, O_NONBLOCK);
 
-            // Set non-blocking
-            fcntl(socket_fd, F_SETFL, O_NONBLOCK);
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(static_cast<uint16_t>(std::stoi(port)));
 
-            sockaddr_in server_addr{};
-            server_addr.sin_family = AF_INET;
-
-            // Resolve hostname
+        // Resolve hostname
+        if (host == "127.0.0.1") {
+            server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        } else {
             struct addrinfo hints = {};
             hints.ai_family = AF_INET;
             hints.ai_socktype = SOCK_STREAM;
@@ -151,134 +143,25 @@ public:
             if (res != 0) {
                 close(socket_fd);
                 socket_fd = -1;
-                continue;
+                return false;
             }
             if (!result) {
                 close(socket_fd);
                 socket_fd = -1;
-                continue;
+                return false;
             }
-            memcpy(&server_addr, result->ai_addr, sizeof(sockaddr_in));
+            memcpy(&server_addr.sin_addr, &((sockaddr_in *)result->ai_addr)->sin_addr, sizeof(in_addr));
             freeaddrinfo(result);
-
-            if (::connect(socket_fd, (sockaddr *)&server_addr, sizeof(server_addr)) <
-                    0 &&
-                errno != EINPROGRESS) {
-                close(socket_fd);
-                socket_fd = -1;
-                continue;
-            }
-
-            // Wait for connection
-            fd_set writefds;
-            FD_ZERO(&writefds);
-            FD_SET(socket_fd, &writefds);
-            struct timeval tv = {5, 0}; // 5 second timeout
-            if (select(socket_fd + 1, nullptr, &writefds, nullptr, &tv) <= 0) {
-                close(socket_fd);
-                socket_fd = -1;
-                continue;
-            }
-
-            int error;
-            socklen_t len = sizeof(error);
-            getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &len);
-            if (error) {
-                close(socket_fd);
-                socket_fd = -1;
-                continue;
-            }
-
-            // SSL setup if needed
-            if (use_ssl) {
-#ifdef LIBUS_USE_OPENSSL
-                SSL_library_init();
-                ssl_ctx = SSL_CTX_new(TLS_client_method());
-                SSL_CTX_set_default_verify_paths(ssl_ctx);
-                SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
-                if (!ssl_ctx) {
-                    close(socket_fd);
-                    socket_fd = -1;
-                    continue;
-                }
-                ssl = SSL_new(ssl_ctx);
-                SSL_set_tlsext_host_name(static_cast<SSL *>(ssl), host.c_str());
-                SSL_set_fd(static_cast<SSL *>(ssl), socket_fd);
-                if (SSL_connect(static_cast<SSL *>(ssl)) != 1) {
-                    SSL_free(static_cast<SSL *>(ssl));
-                    ssl = nullptr;
-                    SSL_CTX_free(ssl_ctx);
-                    ssl_ctx = nullptr;
-                    close(socket_fd);
-                    socket_fd = -1;
-                    continue;
-                }
-#else
-                // SSL not supported
-                close(socket_fd);
-                socket_fd = -1;
-                continue;
-#endif
-            }
-
-            connected = true;
-            return true;
         }
-        return false;
-    }
 
-        // Wait for connection
-        fd_set writefds;
-        FD_ZERO(&writefds);
-        FD_SET(socket_fd, &writefds);
-        struct timeval tv = {5, 0}; // 5 second timeout
-        if (select(socket_fd + 1, nullptr, &writefds, nullptr, &tv) <= 0) {
+        state = CONNECTING;
+        if (::connect(socket_fd, (sockaddr *)&server_addr, sizeof(server_addr)) < 0 && errno != EINPROGRESS) {
+            state = DONE;
             close(socket_fd);
             socket_fd = -1;
             return false;
         }
 
-        int error;
-        socklen_t len = sizeof(error);
-        getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &len);
-        if (error) {
-            close(socket_fd);
-            socket_fd = -1;
-            return false;
-        }
-
-        // SSL setup if needed
-        if (use_ssl) {
-#ifdef LIBUS_USE_OPENSSL
-            SSL_library_init();
-            ssl_ctx = SSL_CTX_new(TLS_client_method());
-            SSL_CTX_set_default_verify_paths(ssl_ctx);
-            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
-            if (!ssl_ctx) {
-                close(socket_fd);
-                socket_fd = -1;
-                return false;
-            }
-            ssl = SSL_new(ssl_ctx);
-            SSL_set_fd(static_cast<SSL *>(ssl), socket_fd);
-            if (SSL_connect(static_cast<SSL *>(ssl)) != 1) {
-                SSL_free(static_cast<SSL *>(ssl));
-                ssl = nullptr;
-                SSL_CTX_free(ssl_ctx);
-                ssl_ctx = nullptr;
-                close(socket_fd);
-                socket_fd = -1;
-                return false;
-            }
-#else
-            // SSL not supported
-            close(socket_fd);
-            socket_fd = -1;
-            return false;
-#endif
-        }
-
-        connected = true;
         return true;
     }
 
@@ -298,6 +181,10 @@ public:
     }
 
     bool isConnected() const { return connected; }
+
+    int get_fd() const { return socket_fd; }
+
+    State get_state() const { return state; }
 
     void sendRequest() {
         if (!connected) return;
@@ -327,22 +214,64 @@ public:
             sent = write(socket_fd, request.data(), request.size());
         }
         if (sent != static_cast<ssize_t>(request.size())) {
+            state = DONE;
             disconnect();
-            if (behavior.failed) behavior.failed();
+            HttpReply reply;
+            reply.status_code = -1;
+            behavior(reply);
             return;
         }
 
-        // Now read response
-        readResponse();
+        shutdown(socket_fd, SHUT_WR); // Close write side to indicate end of request
+        state = REQUEST_SENT;
+    }
 
-        if (!redirect_url.empty() && redirect_count < 5) {
-            redirect_count++;
-            disconnect();
-            if (connect(redirect_url)) {
+    void process(bool can_read, bool can_write) {
+        if (state == CONNECTING && can_write) {
+            int error = 0;
+            socklen_t len = sizeof(error);
+            if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+                state = CONNECTED;
+                connected = true;
+                // SSL setup if needed
+                if (use_ssl) {
+#ifdef LIBUS_USE_OPENSSL
+                    if (!ssl_ctx) {
+                        state = DONE;
+                        close(socket_fd);
+                        socket_fd = -1;
+                        HttpReply reply;
+                        reply.status_code = -1;
+                        behavior(reply);
+                        return;
+                    }
+                    ssl = SSL_new(static_cast<SSL_CTX *>(ssl_ctx));
+                    SSL_set_tlsext_host_name(static_cast<SSL *>(ssl), host.c_str());
+                    SSL_set_fd(static_cast<SSL *>(ssl), socket_fd);
+                    if (SSL_connect(static_cast<SSL *>(ssl)) != 1) {
+                        SSL_free(static_cast<SSL *>(ssl));
+                        ssl = nullptr;
+                        state = DONE;
+                        close(socket_fd);
+                        socket_fd = -1;
+                        HttpReply reply;
+                        reply.status_code = -1;
+                        behavior(reply);
+                        return;
+                    }
+#endif
+                }
                 sendRequest();
             } else {
-                if (behavior.failed) behavior.failed();
+                state = DONE;
+                close(socket_fd);
+                socket_fd = -1;
+                HttpReply reply;
+                reply.status_code = -1;
+                behavior(reply);
             }
+        } else if (state == REQUEST_SENT && can_read) {
+            readResponse();
         }
     }
 
@@ -355,6 +284,9 @@ private:
         int status_code = 0;
         std::string status_message;
         std::vector<std::pair<std::string_view, std::string_view>> response_headers;
+        int content_length = -1;
+        size_t header_end = 0;
+        bool is_redirect = false;
 
         while (true) {
 #ifdef LIBUS_USE_OPENSSL
@@ -393,7 +325,11 @@ private:
                         if (space1 != std::string_view::npos) {
                             size_t space2 = status_line.find(' ', space1 + 1);
                             if (space2 != std::string_view::npos) {
-                                status_code = std::stoi(std::string(status_line.substr(space1 + 1, space2 - space1 - 1)));
+                                try {
+                                  status_code = std::stoi(std::string(status_line.substr(space1 + 1, space2 - space1 - 1)));
+                              } catch (...) {
+                                  status_code = -1;
+                              }
                                 status_message = std::string(status_line.substr(space2 + 1));
                             }
                         }
@@ -413,41 +349,233 @@ private:
                             while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
                             while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
                             response_headers.emplace_back(key, value);
+                            if (std::string_view(key) == "Content-Length") {
+                                try {
+                                    content_length = std::stoi(std::string(value));
+                                } catch (...) {
+                                    content_length = -1;
+                                }
+                            }
                         }
                         pos = line_end + 2;
                     }
 
                     headers_parsed = true;
-                    if (status_code >= 300 && status_code < 400) {
-                        for (auto &[key, value] : response_headers) {
-                            if (std::string_view(key) == "Location") {
-                                redirect_url = std::string(value);
-                                break;
-                            }
-                        }
-                    }
-                    if (redirect_url.empty() && behavior.response) {
-                        behavior.response(this, status_code, status_message, response_headers);
-                    }
-
                     // Remove headers from buffer
                     response_buffer.erase(0, header_end + 4);
                 }
             }
 
             if (headers_parsed && !response_buffer.empty()) {
-                if (redirect_url.empty() && behavior.data) {
-                    behavior.data(this, response_buffer, false);
-                }
-                response_buffer.clear();
+                // Accumulate body
             }
         }
 
-        // End of data
-        if (redirect_url.empty() && behavior.data) {
-            behavior.data(this, {}, true);
+        // End of response
+        if (headers_parsed && (content_length == -1 || response_buffer.size() >= header_end + 4 + content_length)) {
+            HttpReply reply;
+            reply.status_code = status_code;
+            reply.status_message = status_message;
+            reply.headers = response_headers;
+            size_t body_start = header_end + 4;
+            size_t body_size = content_length != -1 ? content_length : response_buffer.size() - body_start;
+            reply.body = response_buffer.substr(body_start, body_size);
+            behavior(reply);
+            state = DONE;
+            disconnect();
+        } else if (!headers_parsed && !response_buffer.empty()) {
+            // Assume simple response without headers
+            HttpReply reply;
+            reply.status_code = 200;
+            reply.status_message = "OK";
+            reply.body = response_buffer;
+            behavior(reply);
+            state = DONE;
+            disconnect();
         }
     }
 };
+
+struct PendingRequest {
+    std::unique_ptr<HttpClient> client;
+    bool done = false;
+};
+
+static std::list<std::unique_ptr<PendingRequest>> pending_requests;
+static std::mutex pending_mutex;
+
+void processHttpRequests(int timeout_ms = 1000) {
+    if (pending_requests.empty()) return;
+
+    fd_set readfds, writefds;
+    FD_ZERO(&readfds);
+    FD_ZERO(&writefds);
+    int max_fd = -1;
+    for (auto &req_ptr : pending_requests) {
+        auto &req = *req_ptr;
+        int fd = req.client->get_fd();
+        if (fd >= 0) {
+            if (req.client->get_state() == HttpClient::CONNECTING) {
+                FD_SET(fd, &writefds);
+                max_fd = std::max(max_fd, fd);
+            } else if (req.client->get_state() == HttpClient::REQUEST_SENT) {
+                FD_SET(fd, &readfds);
+                max_fd = std::max(max_fd, fd);
+            }
+        }
+    }
+
+    if (max_fd == -1) return;
+
+    struct timeval *tv_ptr = nullptr;
+    struct timeval tv;
+    if (timeout_ms != -1) {
+        tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        tv_ptr = &tv;
+    }
+    if (select(max_fd + 1, &readfds, &writefds, nullptr, tv_ptr) > 0) {
+        for (auto it = pending_requests.begin(); it != pending_requests.end(); ) {
+            auto &req = **it;
+            int fd = req.client->get_fd();
+            if (fd >= 0) {
+                bool can_read = FD_ISSET(fd, &readfds);
+                bool can_write = FD_ISSET(fd, &writefds);
+                req.client->process(can_read, can_write);
+            }
+
+            if (req.client->get_state() == HttpClient::DONE) {
+                req.done = true;
+            }
+
+            if (req.done) {
+                it = pending_requests.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+class HttpClientPool {
+private:
+    class HttpManager {
+    public:
+        std::thread eventThread;
+        std::atomic<bool> running{false};
+        std::atomic<int> refCount{0};
+        std::atomic<int> request_count{0};
+        void *ssl_ctx = nullptr;
+
+        void start();
+        void stop();
+        void eventLoop();
+    };
+
+    static HttpManager manager;
+    static std::mutex initMutex;
+
+public:
+    static std::future<HttpReply> HttpRequest(std::string_view method, std::string_view url,
+                            std::string_view body = "{}", std::string_view content_type = "application/json",
+                            std::string_view user_agent = "uWebSockets/1.0");
+    static bool hasPendingRequests();
+    static void wait();
+    static void stop();
+};
+
+HttpClientPool::HttpManager HttpClientPool::manager{};
+std::mutex HttpClientPool::initMutex{};
+
+void HttpClientPool::HttpManager::start() {
+    std::lock_guard<std::mutex> lock(initMutex);
+    if (++refCount == 1 && !running) {
+        running = true;
+#ifdef LIBUS_USE_OPENSSL
+        ssl_ctx = SSL_CTX_new(TLS_client_method());
+        SSL_CTX_set_default_verify_paths(static_cast<SSL_CTX *>(ssl_ctx));
+#endif
+        eventThread = std::thread(&HttpClientPool::HttpManager::eventLoop, this);
+    }
+}
+
+void HttpClientPool::HttpManager::stop() {
+    std::lock_guard<std::mutex> lock(initMutex);
+    if (--refCount == 0) {
+        running = false;
+        if (eventThread.joinable()) {
+            eventThread.join();
+        }
+#ifdef LIBUS_USE_OPENSSL
+        if (ssl_ctx) SSL_CTX_free(static_cast<SSL_CTX *>(ssl_ctx));
+#endif
+    }
+}
+
+void HttpClientPool::HttpManager::eventLoop() {
+    while (running) {
+        processHttpRequests(-1);
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex);
+            if (pending_requests.empty() && request_count == 0) {
+                running = false;
+            }
+        }
+    }
+}
+
+std::future<HttpReply> HttpClientPool::HttpRequest(std::string_view method, std::string_view url,
+                                 std::string_view body, std::string_view content_type, std::string_view user_agent) {
+    manager.start();
+
+    auto promise_ptr = std::make_shared<std::promise<HttpReply>>();
+    auto future = promise_ptr->get_future();
+
+    ++manager.request_count;
+
+    auto callback = [promise_ptr, &request_count = manager.request_count](HttpReply reply) {
+        promise_ptr->set_value(std::move(reply));
+        --request_count;
+    };
+
+    auto req = std::make_unique<PendingRequest>();
+    req->client = std::make_unique<HttpClient>(callback, manager.ssl_ctx);
+    req->client->setMethod(std::string(method));
+    if (content_type != "{}") {
+        req->client->addHeader("Content-Type", std::string(content_type));
+    }
+    if (user_agent != "{}") {
+        req->client->addHeader("User-Agent", std::string(user_agent));
+    }
+    if (body != "{}") {
+        req->client->setBody(std::string(body));
+    }
+
+    if (!req->client->connect(std::string(url))) {
+        HttpReply reply;
+        reply.status_code = -1;
+        callback(reply);
+        return future;
+    }
+
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    pending_requests.push_back(std::move(req));
+
+    return future;
+}
+
+bool HttpClientPool::hasPendingRequests() {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    return !pending_requests.empty();
+}
+
+void HttpClientPool::wait() {
+    while (hasPendingRequests()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void HttpClientPool::stop() {
+    manager.stop();
+}
 
 } // namespace uWS
