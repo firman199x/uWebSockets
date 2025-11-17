@@ -37,6 +37,7 @@ struct HttpReply {
     std::string status_message;
     std::vector<std::pair<std::string_view, std::string_view>> headers;
     std::string body;
+    std::function<void(HttpReply)> callback;
 };
 
 struct HttpParsedUrl {
@@ -494,6 +495,7 @@ private:
 
 public:
     static std::future<HttpReply> HttpRequest(std::string_view method, std::string_view url,
+                            std::function<void(HttpReply)> callback = nullptr,
                             std::string_view body = "{}", std::string_view content_type = "application/json",
                             std::string_view user_agent = "uWebSockets/1.0");
     static bool hasPendingRequests();
@@ -542,6 +544,7 @@ void HttpClientPool::HttpManager::eventLoop() {
 }
 
 std::future<HttpReply> HttpClientPool::HttpRequest(std::string_view method, std::string_view url,
+                                 std::function<void(HttpReply)> user_callback,
                                  std::string_view body, std::string_view content_type, std::string_view user_agent) {
     manager.start();
 
@@ -550,7 +553,8 @@ std::future<HttpReply> HttpClientPool::HttpRequest(std::string_view method, std:
 
     ++manager.request_count;
 
-    auto callback = [promise_ptr, &request_count = manager.request_count](HttpReply reply) {
+    auto callback = [promise_ptr, user_callback, &request_count = manager.request_count](HttpReply reply) {
+        reply.callback = user_callback;
         promise_ptr->set_value(std::move(reply));
         --request_count;
     };
