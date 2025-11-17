@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <vector>
 #include <list>
+#include <poll.h>
 #ifdef LIBUS_USE_OPENSSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -418,60 +419,60 @@ static std::mutex pending_mutex;
 void processHttpRequests(int timeout_ms = 1000) {
     if (pending_requests.empty()) return;
 
-    fd_set readfds, writefds;
-    FD_ZERO(&readfds);
-    FD_ZERO(&writefds);
-    int max_fd = -1;
-    for (auto &req_ptr : pending_requests) {
-        auto &req = *req_ptr;
+    std::vector<pollfd> pollfds;
+    std::vector<std::list<std::unique_ptr<PendingRequest>>::iterator> iters;
+    for (auto it = pending_requests.begin(); it != pending_requests.end(); ++it) {
+        auto &req = **it;
         int fd = req.client->get_fd();
         if (fd >= 0) {
+            short events = 0;
             if (req.client->get_state() == HttpClient::CONNECTING) {
-                FD_SET(fd, &writefds);
-                max_fd = std::max(max_fd, fd);
+                events = POLLOUT;
             } else if (req.client->get_state() == HttpClient::REQUEST_SENT) {
-                FD_SET(fd, &readfds);
-                max_fd = std::max(max_fd, fd);
+                events = POLLIN;
+            }
+            if (events) {
+                pollfds.push_back({fd, events, 0});
+                iters.push_back(it);
             }
         }
     }
 
-    if (max_fd == -1) return;
+    if (pollfds.empty()) return;
 
-    struct timeval *tv_ptr = nullptr;
-    struct timeval tv;
-    if (timeout_ms != -1) {
-        tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        tv_ptr = &tv;
-    }
-    if (select(max_fd + 1, &readfds, &writefds, nullptr, tv_ptr) > 0) {
-        for (auto it = pending_requests.begin(); it != pending_requests.end(); ) {
+    int ret = poll(pollfds.data(), pollfds.size(), timeout_ms);
+    if (ret > 0) {
+        for (size_t i = 0; i < pollfds.size(); ++i) {
+            auto it = iters[i];
             auto &req = **it;
-            int fd = req.client->get_fd();
-            if (fd >= 0) {
-                bool can_read = FD_ISSET(fd, &readfds);
-                bool can_write = FD_ISSET(fd, &writefds);
-                req.client->process(can_read, can_write);
-            }
+            bool can_read = pollfds[i].revents & POLLIN;
+            bool can_write = pollfds[i].revents & POLLOUT;
+            req.client->process(can_read, can_write);
+        }
+    }
 
-            if (req.client->get_state() == HttpClient::DONE) {
+    // Check timeouts and done
+    std::vector<std::list<std::unique_ptr<PendingRequest>>::iterator> to_erase;
+    for (auto it = pending_requests.begin(); it != pending_requests.end(); ++it) {
+        auto &req = **it;
+        if (req.client->get_state() == HttpClient::DONE) {
+            req.done = true;
+        } else {
+            // Check for timeout
+            auto now = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - req.start_time);
+            if (elapsed.count() > 30) {
+                req.client->timeout();
                 req.done = true;
-            } else {
-                // Check for timeout
-                auto now = std::chrono::high_resolution_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - req.start_time);
-                if (elapsed.count() > 30) {
-                    req.client->timeout();
-                    req.done = true;
-                }
-            }
-
-            if (req.done) {
-                it = pending_requests.erase(it);
-            } else {
-                ++it;
             }
         }
+
+        if (req.done) {
+            to_erase.push_back(it);
+        }
+    }
+    for (auto it : to_erase) {
+        pending_requests.erase(it);
     }
 }
 

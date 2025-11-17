@@ -8,14 +8,14 @@ int main() {
     std::cout << "HTTP Client Example - Async Interface" << std::endl;
     std::cout << "=====================================" << std::endl;
 
-    const int num_requests = 10;
+    const int num_requests = 8000;
     std::vector<std::future<uWS::HttpReply>> futures;
 
     // Start multiple async requests
     for (int i = 0; i < num_requests; ++i) {
         futures.push_back(uWS::HttpClientPool::HttpRequest("GET", "http://localhost:8080/health", [](uWS::HttpReply r) {
             // This lambda is executed in the main thread after f.get()
-            std::cout << "Processed in main thread: " << r.status_code << std::endl;
+            // std::cout << "Processed in main thread: " << r.status_code << std::endl;
         }));
     }
 
@@ -31,6 +31,7 @@ int main() {
                     reply.callback(reply);
                 }
                 it = futures.erase(it);
+                // std::cout << "remaining: " << futures.size() << std::endl;
             } else {
                 ++it;
             }
