@@ -8,7 +8,7 @@ int main() {
     std::cout << "HTTP Client Example - Async Interface" << std::endl;
     std::cout << "=====================================" << std::endl;
 
-    const int num_requests = 10;
+    const int num_requests = 1000;
     std::vector<std::future<uWS::HttpReply>> futures;
 
     // Start multiple async requests
