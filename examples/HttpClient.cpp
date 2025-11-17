@@ -13,19 +13,23 @@ int main() {
 
     // Start multiple async requests
     for (int i = 0; i < num_requests; ++i) {
-        if (i == 5) 
-        futures.push_back(uWS::HttpClientPool::HttpRequest("GET", "http://localhost:8081/invalid"));
-        else
         futures.push_back(uWS::HttpClientPool::HttpRequest("GET", "http://localhost:8080/health"));
     }
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Wait for all responses
-    for (auto &f : futures) {
-        auto reply = f.get();
-        std::cout << reply.status_code << " reply: " << reply.body << "\n";
-        // Process reply if needed
+    // Wait for all responses, processing as they become ready
+    while (!futures.empty()) {
+        for (auto it = futures.begin(); it != futures.end(); ) {
+            if (it->wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
+                auto reply = it->get();
+                std::cout << reply.status_code << " reply: " << reply.body << "\n";
+                // Process reply if needed
+                it = futures.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
