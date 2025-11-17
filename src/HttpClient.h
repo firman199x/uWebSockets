@@ -21,6 +21,7 @@
 #include <mutex>
 #include <atomic>
 #include <future>
+#include <chrono>
 #include <unistd.h>
 #include <vector>
 #include <list>
@@ -185,6 +186,14 @@ public:
     int get_fd() const { return socket_fd; }
 
     State get_state() const { return state; }
+
+    void timeout() {
+        state = DONE;
+        disconnect();
+        HttpReply reply;
+        reply.status_code = -1;
+        behavior(reply);
+    }
 
     void sendRequest() {
         if (!connected) return;
@@ -398,6 +407,7 @@ private:
 
 struct PendingRequest {
     std::unique_ptr<HttpClient> client;
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
     bool done = false;
 };
 
@@ -445,6 +455,14 @@ void processHttpRequests(int timeout_ms = 1000) {
 
             if (req.client->get_state() == HttpClient::DONE) {
                 req.done = true;
+            } else {
+                // Check for timeout
+                auto now = std::chrono::high_resolution_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - req.start_time);
+                if (elapsed.count() > 30) {
+                    req.client->timeout();
+                    req.done = true;
+                }
             }
 
             if (req.done) {
@@ -513,7 +531,7 @@ void HttpClientPool::HttpManager::stop() {
 
 void HttpClientPool::HttpManager::eventLoop() {
     while (running) {
-        processHttpRequests(-1);
+        processHttpRequests(1000); // 1 second timeout
         {
             std::lock_guard<std::mutex> lock(pending_mutex);
             if (pending_requests.empty() && request_count == 0) {
@@ -556,6 +574,8 @@ std::future<HttpReply> HttpClientPool::HttpRequest(std::string_view method, std:
         callback(reply);
         return future;
     }
+
+    req->start_time = std::chrono::high_resolution_clock::now();
 
     std::lock_guard<std::mutex> lock(pending_mutex);
     pending_requests.push_back(std::move(req));
